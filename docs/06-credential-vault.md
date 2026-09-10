@@ -3,6 +3,8 @@
 ## Phase 1 to 3
 No vault yet. Connection credentials sit in a local config file. Do not encrypt this in a way that implies false security; a plain file is acceptable, but never described as a vault, until phase 4.
 
+The file is written with owner-only permissions on Unix, and credentials are wrapped in a type that redacts itself in logs, errors, and panics (docs/16-security-and-cybersafety-checklist.md item 2). Neither is encryption, and neither makes this a vault; they limit who can read the file and keep the plaintext from leaking into output. See docs/15-data-model.md for the stored shape.
+
 ## Phase 4 onward
 - Credentials for every saved connection are encrypted at rest, using a locally generated key.
 - The key itself is protected by a passphrase the user sets.

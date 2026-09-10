@@ -6,7 +6,13 @@
 //! a shared vocabulary crate is how that stays true as modules are added.
 //!
 //! Phase 1 scope: types are introduced by the task that needs them (T6 adds the
-//! real `Intent`). This crate currently carries only the phase marker below.
+//! real `Intent`).
+
+mod engine;
+mod secret;
+
+pub use engine::Engine;
+pub use secret::{Secret, REDACTED};
 
 /// The phase of docs/03-phases-roadmap.md this build implements.
 ///

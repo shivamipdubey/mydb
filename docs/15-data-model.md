@@ -5,6 +5,11 @@ This describes what MYDB stores about itself, not the data inside a user's conne
 ## connections
 id, name, engine type, connection details reference (points to vault entry), production flag, created at, last health check result.
 
+### Phase 1 shape
+Phase 1 has no vault and no dashboard, so the stored record is: id, name, engine, host, port, database, username, password, production flag. The password is held in plaintext, which docs/06-credential-vault.md permits until phase 4 and forbids describing as a vault. Created at and last health check result are omitted until something consumes them.
+
+Storage is a versioned JSON file at the user's config directory, `MYDB/connections.json`. Writes are atomic (temporary file, then rename) so an interrupted save cannot truncate the list, and the file is set to owner-only permissions on Unix. Neither measure is encryption; they limit damage while the credentials are plaintext. Phase 4 replaces the credential handling here with the real vault.
+
 ## vault_entries
 id, connection id, encrypted credential blob, key reference. Never a plaintext field of any kind.
 
