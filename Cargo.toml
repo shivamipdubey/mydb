@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+mydb-core = { path = "crates/mydb-core" }
+mydb-parser = { path = "crates/mydb-parser" }
+mydb-adapters = { path = "crates/mydb-adapters" }
+mydb-confirmation = { path = "crates/mydb-confirmation" }
+mydb-storage = { path = "crates/mydb-storage" }
+
+# Deny the panic-shaped constructs across the whole workspace. docs/17 requires
+# every fallible adapter call to return a typed result rather than throw into
+# the UI layer; these lints make a stray unwrap a build failure, not a review
+# catch. Test code is exempt via the crate-level allow in each test module.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

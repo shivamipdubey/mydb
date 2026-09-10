@@ -1,0 +1,15 @@
+# Node
+node_modules/
+dist/
+*.log
+
+# Rust
+target/
+
+# macOS
+.DS_Store
+
+# Local app config written at runtime (may contain database passwords, phase 1
+# stores them in a plain file per docs/06-credential-vault.md; never commit it)
+*.local.json
+/.mydb/

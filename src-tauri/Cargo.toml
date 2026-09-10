@@ -1,0 +1,29 @@
+[package]
+name = "mydb-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MYDB desktop application shell"
+
+[lib]
+name = "mydb_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-log = "2"
+log = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+mydb-core = { workspace = true }
+mydb-parser = { workspace = true }
+mydb-adapters = { workspace = true }
+mydb-confirmation = { workspace = true }
+mydb-storage = { workspace = true }
+
+[lints]
+workspace = true

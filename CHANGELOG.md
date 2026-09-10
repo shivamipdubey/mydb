@@ -1,0 +1,17 @@
+# Changelog
+
+Conventions: docs/21-changelog-conventions.md. One entry per distinct change, newest at the top.
+
+2026-09-10, Phase 1 (T1): named the concrete dependency-scanning tools in the security checklist and recorded the scaffold's scan result. Reason: checklist item 6 required checking dependencies against vulnerability databases without naming a tool, so the check was unrepeatable. `cargo audit` reports 0 vulnerabilities across 444 crates and `npm audit` 0 across the frontend; 7 informational advisories remain (6 unmaintained crates, plus RUSTSEC-2024-0429, an unsound iterator in glib 0.18.5 that affects Linux GTK only), all transitive through Tauri and none directly chosen by us. Updated docs/16-security-and-cybersafety-checklist.md.
+
+2026-09-10, Phase 1 (T1): scaffolded the application as a Tauri v2 desktop app with a Rust Cargo workspace backend and a TypeScript/React frontend, split into the crates docs/17-coding-standards.md requires (core, parser, adapters, confirmation, storage), plus test runners, linters, and a git repository. Reason: every later task needs a place to live and a harness to be tested in, and docs/02-architecture.md promised a tech stack it never actually named. The workspace denies unwrap, expect, and panic in non-test code so docs/17's typed-result rule fails the build rather than waiting on review, and the Tauri default null content security policy was replaced with a restrictive offline-only policy. Updated docs/02-architecture.md and CLAUDE.md.
+
+2026-09-10, Phase 1: recorded ALTER TABLE as phase 2 backlog work rather than phase 1 scope. Reason: docs/04 defines a preview rule for it, which made it read as buildable now, but phase 1 ships DROP TABLE and TRUNCATE only; the note keeps the rule documented without implying it is implemented. Updated docs/03-phases-roadmap.md and docs/04-database-adapters.md.
+
+2026-09-10, Phase 1: stated macOS packaging as an explicit phase 1 deliverable. Reason: phase 3's "remaining two operating systems" wording implied macOS had been packaged earlier, but no phase actually claimed it, leaving the deliverable unowned. Updated docs/03-phases-roadmap.md.
+
+2026-09-10, Phase 1: tagged every core screen in the UI guidelines with the phase it ships in, and scoped phase 1 to the command bar, preview screen, and connection manager. Reason: the screen list gave no build order, so the recovery bin viewer, audit log viewer, and dashboard read as phase 1 work despite depending on phase 2 storage and later features; noted that the roadmap has no dashboard entry at all and that phase 5 is its assumed home per the PRD. Updated docs/12-ui-ux-guidelines.md.
+
+2026-09-10, Phase 1: recorded that the production flag is settable by any user until phase 4. Reason: the doc said a connection is flagged "by its admin," but no role system exists before phase 4, so the sentence described a check that cannot be implemented yet; the extra confirmation step itself is unchanged and applies from phase 1 onward. Updated docs/11-production-safety-flag.md.
+
+2026-09-10, Phase 1: corrected the audit and recovery citation in the confirmation workflow's execute step and noted phase 1's scope. Reason: step 10 cited docs/06 (the credential vault) for audit and recovery storage instead of docs/07 and docs/15, and gave no indication that phase 1 has only a basic command history, with before-state capture and recovery entries starting in phase 2. Updated docs/05-confirmation-workflow.md.
