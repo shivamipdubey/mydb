@@ -17,7 +17,7 @@
 //! The result is that "execute without a preview" is not a bug to be caught in
 //! review. It does not compile.
 
-use mydb_core::{Column, Intent};
+use mydb_core::{Column, Intent, StateSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::records::{Record, RecordSet};
@@ -222,8 +222,39 @@ impl ApprovedWrite {
     }
 }
 
+/// How many affected records a write captures for the audit log.
+///
+/// Matches docs/07-audit-log-and-recovery-bin.md's default size threshold: an
+/// operation smaller than this has its full state recorded, and a larger one
+/// needs only a sample here because the recovery bin holds the whole thing.
+/// T17 makes the threshold configurable and this follows it.
+pub const STATE_CAPTURE_LIMIT: usize = 1_000;
+
 /// What happened when a confirmed write ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOutcome {
     pub rows_affected: u64,
+    /// The affected records as they stood before the write, captured inside
+    /// the same transaction so nothing can change between reading them and
+    /// writing over them.
+    pub before: StateSnapshot,
+    /// The same records afterwards.
+    ///
+    /// `None` means the state could not be captured, not that it was empty.
+    /// An update needs to match records back to the ones it changed, which
+    /// requires a single-column primary key; a table without one, or with a
+    /// composite key, cannot be re-read reliably and says so rather than
+    /// reporting an empty result that would read as "the records vanished".
+    pub after: Option<StateSnapshot>,
+}
+
+impl ExecutionOutcome {
+    /// A write whose records are gone afterwards, such as a delete.
+    pub fn removing(rows_affected: u64, before: StateSnapshot) -> Self {
+        Self {
+            rows_affected,
+            before,
+            after: Some(StateSnapshot::empty()),
+        }
+    }
 }

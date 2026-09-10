@@ -159,8 +159,8 @@ pub enum CommandOutcome {
 pub struct ExecutionSummary {
     pub description: String,
     pub rows_affected: u64,
-    /// Set when the write succeeded but could not be recorded in the command
-    /// history. Surfaced rather than swallowed: a user who believes their
-    /// commands are being recorded should be told when one was not.
-    pub history_warning: Option<String>,
+    /// Set when the write succeeded but could not be recorded in the audit
+    /// log. Surfaced rather than swallowed: a user who believes their writes
+    /// are being recorded should be told when one was not.
+    pub record_warning: Option<String>,
 }

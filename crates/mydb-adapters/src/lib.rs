@@ -16,7 +16,9 @@ mod sql;
 
 pub use error::AdapterError;
 pub use health::{Health, HealthStatus};
-pub use preview::{ApprovedWrite, ExecutionOutcome, Preview, PreviewBody, TableOutline};
+pub use preview::{
+    ApprovedWrite, ExecutionOutcome, Preview, PreviewBody, TableOutline, STATE_CAPTURE_LIMIT,
+};
 pub use records::{Record, RecordSet, SAMPLE_LIMIT};
 
 use mydb_core::{Intent, Schema};

@@ -154,10 +154,10 @@ export function App() {
             </div>
           )}
 
-          {executed?.historyWarning && (
+          {executed?.recordWarning && (
             <p className="warning">
               <span aria-hidden="true">⚠</span> The change ran, but could not be
-              recorded in the command history: {executed.historyWarning}
+              recorded in the audit log: {executed.recordWarning}
             </p>
           )}
         </section>

@@ -1,9 +1,14 @@
 //! The PostgreSQL adapter (docs/04-database-adapters.md).
 //!
-//! Phase 1's only engine. Preview and execute arrive in T7; this module
-//! currently covers connect, describe schema, and health.
+//! Phase 1's only engine, and the reference the other adapters follow.
+//! Covers connect, describe schema, health, and preview plus execute for
+//! delete, insert, update, drop table, and truncate, with before and after
+//! state captured inside each write's own transaction
+//! (docs/07-audit-log-and-recovery-bin.md).
 
-use mydb_core::{Assignment, Column, Intent, Operation, Schema, Table, Value};
+use mydb_core::{
+    Assignment, Column, Intent, Operation, RecordSnapshot, Schema, StateSnapshot, Table, Value,
+};
 use tokio_postgres::{Client, NoTls};
 
 use crate::records::{Record, RecordSet, SAMPLE_LIMIT};
@@ -13,6 +18,7 @@ use crate::sql::{
 };
 use crate::{
     Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, TableOutline,
+    STATE_CAPTURE_LIMIT,
 };
 
 /// Everything needed to reach one Postgres database.
@@ -350,29 +356,350 @@ impl PostgresAdapter {
         Ok(Preview::new(intent.clone(), affected))
     }
 
-    /// Runs a confirmed DELETE inside a transaction.
+    /// Runs a confirmed DELETE, capturing what it removes.
     ///
-    /// docs/04-database-adapters.md requires the real write to be wrapped in a
-    /// transaction where the engine supports it, so a mid-statement failure
-    /// cannot leave a partial change behind.
+    /// The capture happens inside the write's own transaction, before the
+    /// delete. Reading the rows in a separate statement beforehand would
+    /// leave a gap in which they could change, and the recovery bin would
+    /// then hold something that was never what the delete actually removed.
     async fn execute_delete(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
-        let schema_columns = columns_of(
-            &self
-                .describe_table(&intent.namespace, &intent.table)
-                .await?,
-        );
+        let shape = self
+            .describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let columns = columns_of(&shape);
         let table = quote_table(&intent.namespace, &intent.table);
 
         // Built by the same function, from the same filter, against the same
         // column types as the preview's WHERE clause. The two cannot describe
-        // different sets of rows, and cannot disagree about how a value is
-        // typed or how text is matched.
-        let clause = build_where(&intent.filter, &schema_columns, 1);
+        // different sets of rows.
+        let clause = build_where(&intent.filter, &columns, 1);
         let params = as_driver_params(&clause.params);
         let sql = format!("DELETE FROM {table}{}", clause.sql);
 
-        self.in_transaction(&sql, &params).await
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(describe_query_failure)?;
+
+        let before = match capture(&transaction, &table, &clause.sql, &params).await {
+            Ok(before) => before,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        let rows_affected = match transaction.execute(&sql, &params).await {
+            Ok(count) => count,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(describe_query_failure(error));
+            }
+        };
+
+        transaction.commit().await.map_err(describe_query_failure)?;
+        Ok(ExecutionOutcome::removing(rows_affected, before))
     }
+
+    /// Runs a confirmed INSERT, capturing the record it creates.
+    ///
+    /// Nothing existed before, so the before-state is empty rather than
+    /// unavailable: that is the truth, not a gap in the capture.
+    async fn execute_insert(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+        let shape = self
+            .describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let columns = columns_of(&shape);
+        Self::check_writable(&intent.assignments, &columns)?;
+
+        let table = quote_table(&intent.namespace, &intent.table);
+        let statement = build_insert(&table, &intent.assignments, &columns);
+        let params = as_driver_params(&statement.params);
+
+        // RETURNING gives the row as it actually landed, including any
+        // defaults the table filled in, which is what the audit log should
+        // hold rather than only the values the command named.
+        let sql = format!(
+            "{} RETURNING to_jsonb({}) AS record",
+            statement.sql,
+            quote_identifier(&intent.table)
+        );
+
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(describe_query_failure)?;
+
+        let rows = match transaction.query(&sql, &params).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(describe_query_failure(error));
+            }
+        };
+
+        transaction.commit().await.map_err(describe_query_failure)?;
+
+        let created: Vec<RecordSnapshot> = rows.iter().filter_map(snapshot_from).collect();
+        Ok(ExecutionOutcome {
+            rows_affected: rows.len() as u64,
+            before: StateSnapshot::empty(),
+            after: Some(StateSnapshot::complete(created)),
+        })
+    }
+
+    /// Runs a confirmed UPDATE, capturing the records before and after.
+    ///
+    /// The after-state is read back by primary key, not by the filter. The
+    /// filter may no longer match: "set active to false where active is
+    /// true" matches nothing once it has run, and re-reading by filter would
+    /// record that the rows had disappeared.
+    async fn execute_update(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+        let shape = self
+            .describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let columns = columns_of(&shape);
+        Self::check_writable(&intent.assignments, &columns)?;
+        let key = self.primary_key(&intent.namespace, &intent.table).await?;
+
+        let table = quote_table(&intent.namespace, &intent.table);
+        let set = build_set(&intent.assignments, &columns, 1);
+        let clause = build_where(&intent.filter, &columns, set.next_placeholder);
+        let sql = format!("UPDATE {table}{}{}", set.sql, clause.sql);
+
+        let mut all_params = set.params.clone();
+        all_params.extend(clause.params.clone());
+        let write_params = as_driver_params(&all_params);
+
+        // The update's WHERE clause is numbered to follow its SET clause, so
+        // the capture needs the same filter renumbered from one. Same
+        // function, same filter, same column types: the rows captured are
+        // necessarily the rows updated.
+        let capture_clause = build_where(&intent.filter, &columns, 1);
+        let capture_params = as_driver_params(&capture_clause.params);
+
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(describe_query_failure)?;
+
+        let before = match capture(&transaction, &table, &capture_clause.sql, &capture_params).await
+        {
+            Ok(before) => before,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        let rows_affected = match transaction.execute(&sql, &write_params).await {
+            Ok(count) => count,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(describe_query_failure(error));
+            }
+        };
+
+        // Re-read by identity while still inside the transaction.
+        let after = match &key {
+            Some(key_column) => {
+                match capture_by_key(&transaction, &table, key_column, &before).await {
+                    Ok(after) => Some(after),
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        return Err(error);
+                    }
+                }
+            }
+            // No single-column primary key, so there is nothing to match the
+            // changed records back by. Saying so beats reporting an empty
+            // result that would read as "the records vanished".
+            None => None,
+        };
+
+        transaction.commit().await.map_err(describe_query_failure)?;
+
+        Ok(ExecutionOutcome {
+            rows_affected,
+            before,
+            after,
+        })
+    }
+
+    /// Runs a confirmed DROP TABLE or TRUNCATE, capturing what it destroys.
+    ///
+    /// Postgres supports transactional DDL, so these get the same
+    /// all-or-nothing guarantee as every other write, and the capture is
+    /// taken inside the same transaction.
+    async fn execute_schema_change(
+        &self,
+        intent: &Intent,
+        previewed_rows: u64,
+    ) -> Result<ExecutionOutcome, AdapterError> {
+        // Confirms the table exists and gives the same clear error as every
+        // other operation when it does not.
+        self.describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let table = quote_table(&intent.namespace, &intent.table);
+
+        let sql = match intent.operation {
+            Operation::DropTable => format!("DROP TABLE {table}"),
+            Operation::Truncate => format!("TRUNCATE TABLE {table}"),
+            // Unreachable through the trait, which routes only these two
+            // here. Returning rather than panicking keeps docs/17's rule
+            // that this layer never throws into the UI.
+            other => {
+                return Err(AdapterError::Unsupported(format!(
+                    "{} is not a schema change",
+                    other.verb()
+                )))
+            }
+        };
+
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(describe_query_failure)?;
+
+        let before = match capture(&transaction, &table, "", &[]).await {
+            Ok(before) => before,
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = transaction.execute(&sql, &[]).await {
+            let _ = transaction.rollback().await;
+            return Err(describe_query_failure(error));
+        }
+
+        transaction.commit().await.map_err(describe_query_failure)?;
+
+        Ok(ExecutionOutcome {
+            // Neither statement reports affected rows, so the count is the
+            // one the user was shown. Reporting zero after emptying a table
+            // would be plainly wrong.
+            rows_affected: previewed_rows,
+            before,
+            after: Some(StateSnapshot::empty()),
+        })
+    }
+
+    /// Reads the table's primary key, when it is a single column.
+    ///
+    /// A composite key or no key at all both return `None`. Both mean the
+    /// same thing to the caller: there is no simple identity to re-read a
+    /// record by, so it must not pretend there is.
+    async fn primary_key(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        const SQL: &str = "
+            SELECT column_name
+              FROM information_schema.table_constraints AS c
+              JOIN information_schema.key_column_usage AS k
+                ON k.constraint_name = c.constraint_name
+               AND k.table_schema = c.table_schema
+             WHERE c.constraint_type = 'PRIMARY KEY'
+               AND c.table_schema = $1
+               AND c.table_name = $2
+             ORDER BY k.ordinal_position
+        ";
+
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(SQL, &[&namespace, &table])
+            .await
+            .map_err(describe_query_failure)?;
+
+        match rows.len() {
+            1 => Ok(rows.first().map(|row| row.get("column_name"))),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Reads a captured row's JSON into a snapshot.
+///
+/// Postgres builds the JSON with `to_jsonb`, so each value keeps its own
+/// type: a number stays a number, a null stays a null, a nested value stays
+/// nested. Casting everything to text for display, as the preview does,
+/// would be wrong here; this is the only record of data that may no longer
+/// exist.
+fn snapshot_from(row: &tokio_postgres::Row) -> Option<RecordSnapshot> {
+    match row.try_get::<_, serde_json::Value>("record") {
+        Ok(serde_json::Value::Object(fields)) => Some(RecordSnapshot::new(fields)),
+        _ => None,
+    }
+}
+
+/// Captures the records a filter matches, with an exact count.
+///
+/// `where_sql` is either a rendered WHERE clause or empty, in which case the
+/// whole table is captured, which is what a drop or truncate destroys.
+async fn capture(
+    transaction: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    where_sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<StateSnapshot, AdapterError> {
+    let total: i64 = transaction
+        .query_one(
+            &format!("SELECT count(*) AS total FROM {table} AS t{where_sql}"),
+            params,
+        )
+        .await
+        .map_err(describe_query_failure)?
+        .get("total");
+
+    let rows = transaction
+        .query(
+            &format!(
+                "SELECT to_jsonb(t) AS record FROM {table} AS t{where_sql} LIMIT {STATE_CAPTURE_LIMIT}"
+            ),
+            params,
+        )
+        .await
+        .map_err(describe_query_failure)?;
+
+    let records: Vec<RecordSnapshot> = rows.iter().filter_map(snapshot_from).collect();
+    Ok(StateSnapshot::sample(records, total.max(0) as u64))
+}
+
+/// Re-reads records by their primary key values.
+///
+/// Both sides are compared as text so one query serves any key type, integer,
+/// uuid or otherwise, without this function needing to know which.
+async fn capture_by_key(
+    transaction: &tokio_postgres::Transaction<'_>,
+    table: &str,
+    key_column: &str,
+    before: &StateSnapshot,
+) -> Result<StateSnapshot, AdapterError> {
+    let keys: Vec<String> = before
+        .records()
+        .iter()
+        .filter_map(|record| record.get(key_column))
+        .map(|value| match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+
+    if keys.is_empty() {
+        return Ok(StateSnapshot::empty());
+    }
+
+    let quoted = quote_identifier(key_column);
+    let rows = transaction
+        .query(
+            &format!(
+                "SELECT to_jsonb(t) AS record FROM {table} AS t \
+                 WHERE t.{quoted}::text = ANY($1) LIMIT {STATE_CAPTURE_LIMIT}"
+            ),
+            &[&keys],
+        )
+        .await
+        .map_err(describe_query_failure)?;
+
+    let records: Vec<RecordSnapshot> = rows.iter().filter_map(snapshot_from).collect();
+    Ok(StateSnapshot::complete(records))
 }
 
 /// A column, plus the default the table gives it when a value is not supplied.
@@ -488,81 +815,6 @@ impl PostgresAdapter {
         Ok(Preview::new(intent.clone(), affected))
     }
 
-    /// Runs a confirmed INSERT inside a transaction.
-    async fn execute_insert(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
-        let schema_columns = columns_of(
-            &self
-                .describe_table(&intent.namespace, &intent.table)
-                .await?,
-        );
-        Self::check_writable(&intent.assignments, &schema_columns)?;
-
-        // Built from the same assignments, against the same column types, as
-        // the statement shown in the preview.
-        let statement = build_insert(
-            &quote_table(&intent.namespace, &intent.table),
-            &intent.assignments,
-            &schema_columns,
-        );
-        let params = as_driver_params(&statement.params);
-
-        self.in_transaction(&statement.sql, &params).await
-    }
-
-    /// Runs a confirmed UPDATE inside a transaction.
-    async fn execute_update(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
-        let schema_columns = columns_of(
-            &self
-                .describe_table(&intent.namespace, &intent.table)
-                .await?,
-        );
-        Self::check_writable(&intent.assignments, &schema_columns)?;
-
-        let table = quote_table(&intent.namespace, &intent.table);
-        let set = build_set(&intent.assignments, &schema_columns, 1);
-        // The WHERE clause continues the placeholder numbering, and is built
-        // by the same function, from the same filter, against the same column
-        // types as the preview's. They cannot select different records.
-        let clause = build_where(&intent.filter, &schema_columns, set.next_placeholder);
-
-        let sql = format!("UPDATE {table}{}{}", set.sql, clause.sql);
-        let mut params = set.params;
-        params.extend(clause.params);
-        let borrowed = as_driver_params(&params);
-
-        self.in_transaction(&sql, &borrowed).await
-    }
-
-    /// Runs one statement in a transaction.
-    ///
-    /// docs/04-database-adapters.md requires the real write to be wrapped in
-    /// a transaction where the engine supports it, so a mid-statement failure
-    /// cannot leave a partial change behind. Shared by every write so no
-    /// operation can be added later that quietly skips it.
-    async fn in_transaction(
-        &self,
-        sql: &str,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-    ) -> Result<ExecutionOutcome, AdapterError> {
-        let mut client = self.client.lock().await;
-        let transaction = client.transaction().await.map_err(describe_query_failure)?;
-
-        let rows_affected = match transaction.execute(sql, params).await {
-            Ok(count) => count,
-            Err(error) => {
-                // Rolled back explicitly rather than by drop, so the failure
-                // path reads as deliberate.
-                let _ = transaction.rollback().await;
-                return Err(describe_query_failure(error));
-            }
-        };
-
-        transaction.commit().await.map_err(describe_query_failure)?;
-        Ok(ExecutionOutcome { rows_affected })
-    }
-}
-
-impl PostgresAdapter {
     /// The DROP TABLE and TRUNCATE preview: the table's current schema and
     /// row count (docs/04-database-adapters.md).
     ///
@@ -592,44 +844,5 @@ impl PostgresAdapter {
             intent.clone(),
             TableOutline::new(schema_columns, row_count.max(0) as u64, count_sql),
         ))
-    }
-
-    /// Runs a confirmed DROP TABLE or TRUNCATE inside a transaction.
-    ///
-    /// Postgres supports transactional DDL, so these get the same
-    /// all-or-nothing guarantee docs/04 requires of every other write.
-    ///
-    /// The table name is an identifier read from the catalog and quoted, not
-    /// user text, and there is no value to bind: these statements take no
-    /// parameters at all.
-    async fn execute_schema_change(
-        &self,
-        intent: &Intent,
-        previewed_rows: u64,
-    ) -> Result<ExecutionOutcome, AdapterError> {
-        // Confirms the table exists and gives the same clear error as every
-        // other operation when it does not.
-        self.describe_table(&intent.namespace, &intent.table)
-            .await?;
-        let table = quote_table(&intent.namespace, &intent.table);
-
-        let sql = match intent.operation {
-            Operation::DropTable => format!("DROP TABLE {table}"),
-            Operation::Truncate => format!("TRUNCATE TABLE {table}"),
-            // Unreachable through the trait, which routes only these two
-            // here. Returning rather than panicking keeps docs/17's rule that
-            // this layer never throws into the UI.
-            other => {
-                return Err(AdapterError::Unsupported(format!(
-                    "{} is not a schema change",
-                    other.verb()
-                )))
-            }
-        };
-
-        self.in_transaction(&sql, &[]).await?;
-        Ok(ExecutionOutcome {
-            rows_affected: previewed_rows,
-        })
     }
 }

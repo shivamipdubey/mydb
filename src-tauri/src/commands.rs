@@ -9,7 +9,7 @@ use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
 use mydb_adapters::{Adapter, Preview, PreviewBody, RecordSet};
 use mydb_confirmation::ExtraStep;
 use mydb_core::{Engine, Schema, Secret};
-use mydb_storage::{CommandHistory, Connection, ConnectionStore, Outcome};
+use mydb_storage::{AuditLog, AuditRecord, CommandHistory, Connection, ConnectionStore, Outcome};
 use tauri::State;
 
 use crate::dto::{
@@ -372,8 +372,8 @@ pub async fn confirm_command(
         .take()
         .ok_or_else(|| "there is nothing waiting to be confirmed".to_string())?;
 
-    let active = state.active.lock().await;
-    let active = active
+    let active_guard = state.active.lock().await;
+    let active = active_guard
         .as_ref()
         .ok_or_else(|| "the connection was closed before this could run".to_string())?;
 
@@ -390,49 +390,58 @@ pub async fn confirm_command(
     // A history that cannot be written must not turn a completed write into a
     // reported failure, so the problem is surfaced separately from the
     // outcome of the write itself.
-    let recorded = record_history(
-        &active.name,
-        &intent,
-        match attempt {
-            Ok(_) => Outcome::Success,
-            Err(_) => Outcome::Failure,
+    let (outcome, affected, before, after) = match &attempt {
+        Ok(completed) => (
+            Outcome::Success,
+            completed.outcome.rows_affected,
+            completed.outcome.before.clone(),
+            completed.outcome.after.clone(),
+        ),
+        // A refused write is recorded as a failure, with nothing captured,
+        // because the transaction took the capture back with it.
+        Err(_) => (
+            Outcome::Failure,
+            0,
+            mydb_core::StateSnapshot::empty(),
+            Some(mydb_core::StateSnapshot::empty()),
+        ),
+    };
+
+    let connection_id = active.id.clone();
+    let connection_name = active.name.clone();
+    drop(active_guard);
+
+    let recorded = record_audit(
+        &state,
+        AttemptedWrite {
+            connection_id: &connection_id,
+            connection_name: &connection_name,
+            intent: &intent,
+            outcome,
+            affected_count: affected,
+            before,
+            after,
         },
-    );
+    )
+    .await;
 
     let completed = attempt.map_err(|error| error.to_string())?;
-
-    if let Err(problem) = recorded {
-        return Ok(ExecutionSummary {
-            description: completed.description,
-            rows_affected: completed.outcome.rows_affected,
-            history_warning: Some(problem),
-        });
-    }
 
     Ok(ExecutionSummary {
         description: completed.description,
         rows_affected: completed.outcome.rows_affected,
-        history_warning: None,
+        // The write ran. A record store that could not be written is worth
+        // telling the user about, but it must not be reported as the write
+        // having failed; that would be the worse lie.
+        record_warning: recorded.err(),
     })
 }
 
-/// Appends one entry to the basic command history (docs/03, phase 1).
-///
-/// Not the audit log. That, with before and after state and the recovery bin
-/// behind it, is phase 2 (docs/07-audit-log-and-recovery-bin.md).
-fn record_history(
-    connection: &str,
-    intent: &mydb_core::Intent,
-    outcome: Outcome,
-) -> Result<(), String> {
-    CommandHistory::open_default()
-        .map_err(|error| error.to_string())?
-        .record_intent(connection, intent, outcome)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 /// Discards the pending write (docs/05 step 9).
+///
+/// Nothing is recorded. docs/05 step 9 keeps a cancelled command out of the
+/// log beyond an optional note, and the audit log is for writes that
+/// happened.
 #[tauri::command]
 pub async fn cancel_command(state: State<'_, AppState>) -> UiResult<String> {
     let pending = state
@@ -443,4 +452,83 @@ pub async fn cancel_command(state: State<'_, AppState>) -> UiResult<String> {
         .ok_or_else(|| "there is nothing waiting to be cancelled".to_string())?;
 
     Ok(pending.cancel().summary)
+}
+
+/// A write that has already been attempted, and what it did.
+struct AttemptedWrite<'a> {
+    connection_id: &'a str,
+    connection_name: &'a str,
+    intent: &'a mydb_core::Intent,
+    outcome: Outcome,
+    affected_count: u64,
+    before: mydb_core::StateSnapshot,
+    /// `None` when the after-state could not be captured, which is not the
+    /// same as it having been empty.
+    after: Option<mydb_core::StateSnapshot>,
+}
+
+/// Appends one entry to the audit log (docs/07-audit-log-and-recovery-bin.md).
+///
+/// Called after the write has been attempted, never before, and for both
+/// outcomes: a write the database refused did happen, and an attempt is a
+/// fact worth keeping (docs/16 item 7).
+async fn record_audit(state: &AppState, attempt: AttemptedWrite<'_>) -> Result<(), String> {
+    let AttemptedWrite {
+        connection_id,
+        connection_name,
+        intent,
+        outcome,
+        affected_count,
+        before,
+        after,
+    } = attempt;
+
+    let mut guard = state.records.lock().await;
+    if guard.is_none() {
+        *guard = Some(open_records()?);
+    }
+    let database = guard
+        .as_ref()
+        .ok_or_else(|| "the local record store is unavailable".to_string())?;
+
+    AuditLog::new(database)
+        .append(AuditRecord {
+            connection_id,
+            connection_name,
+            intent,
+            result: outcome,
+            affected_count,
+            before,
+            // An update on a table with no single-column primary key cannot
+            // have its records matched back afterwards. Recording an empty
+            // after-state would read as "the records vanished", so the log
+            // holds nothing there and the viewer says why.
+            after: after.unwrap_or_else(mydb_core::StateSnapshot::empty),
+            recovery_entry_id: None,
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Opens the local record store, importing phase 1's command history the
+/// first time.
+///
+/// The import runs once, when the audit log is still empty. Those entries
+/// could never hold before or after state, so they arrive flagged as
+/// predating capture rather than dropped: the record of what a user did
+/// stays continuous.
+pub(crate) fn open_records() -> Result<rusqlite::Connection, String> {
+    let path = mydb_storage::database_path().map_err(|error| error.to_string())?;
+    let database = mydb_storage::open_database(&path).map_err(|error| error.to_string())?;
+
+    let log = AuditLog::new(&database);
+    if log.count().map_err(|error| error.to_string())? == 0 {
+        if let Ok(history) = CommandHistory::open_default() {
+            // A failed import must not stop the app from recording new
+            // writes, which matter more than old ones.
+            let _ = history.import_into(&log);
+        }
+    }
+
+    Ok(database)
 }

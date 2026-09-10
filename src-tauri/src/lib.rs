@@ -17,9 +17,25 @@ fn implemented_phase() -> u8 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::Manager;
+
     let result = tauri::Builder::default()
         .manage(state::AppState::default())
         .setup(|app| {
+            // Opened at startup rather than on the first write, so phase 1's
+            // command history is imported once on launch and the audit log
+            // viewer is not empty until the user happens to change something.
+            // A failure here must not stop the app: the record store matters,
+            // but not more than being able to run at all.
+            match commands::open_records() {
+                Ok(database) => {
+                    if let Ok(mut guard) = app.state::<state::AppState>().records.try_lock() {
+                        *guard = Some(database);
+                    }
+                }
+                Err(problem) => log::warn!("could not open the local record store: {problem}"),
+            }
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

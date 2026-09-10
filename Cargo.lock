@@ -2065,6 +2065,7 @@ dependencies = [
  "async-trait",
  "mydb-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
@@ -2080,6 +2081,7 @@ dependencies = [
  "mydb-core",
  "mydb-parser",
  "mydb-storage",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
@@ -2630,6 +2632,8 @@ dependencies = [
  "bytes",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
 ]
 
 [[package]]

@@ -32,4 +32,7 @@ pub struct AppState {
     /// Only ever one: a second command replaces it, which is correct, because
     /// a preview the user has moved on from should not remain confirmable.
     pub pending: Mutex<Option<PendingWrite>>,
+    /// The local database holding the audit log and, from T3, the recovery
+    /// bin. Opened once and kept, since every confirmed write appends to it.
+    pub records: Mutex<Option<rusqlite::Connection>>,
 }

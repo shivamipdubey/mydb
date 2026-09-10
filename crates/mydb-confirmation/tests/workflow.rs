@@ -79,6 +79,8 @@ impl Adapter for StubAdapter {
         }
         Ok(ExecutionOutcome {
             rows_affected: approved.preview().affected_count(),
+            before: mydb_core::StateSnapshot::empty(),
+            after: Some(mydb_core::StateSnapshot::empty()),
         })
     }
 }
