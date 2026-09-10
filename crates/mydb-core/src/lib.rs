@@ -9,9 +9,11 @@
 //! real `Intent`).
 
 mod engine;
+mod schema;
 mod secret;
 
 pub use engine::Engine;
+pub use schema::{Column, Schema, Table};
 pub use secret::{Secret, REDACTED};
 
 /// The phase of docs/03-phases-roadmap.md this build implements.

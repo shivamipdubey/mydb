@@ -2018,6 +2018,7 @@ dependencies = [
 name = "mydb-adapters"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "mydb-core",
  "serde",
  "thiserror 2.0.20",

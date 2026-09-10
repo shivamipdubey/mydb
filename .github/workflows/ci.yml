@@ -111,6 +111,9 @@ jobs:
           --health-timeout 3s
           --health-retries 30
     env:
+      # A service container publishes on the standard port; local development
+      # uses a non-default one to avoid colliding with a real Postgres.
+      MYDB_TEST_PG_PORT: '5432'
       MYDB_TEST_DATABASE_URL: host=localhost port=5432 user=mydb_test password=mydb_test_password dbname=mydb_test
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
