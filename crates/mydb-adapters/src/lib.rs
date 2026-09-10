@@ -10,11 +10,14 @@
 mod error;
 mod health;
 pub mod postgres;
+mod preview;
+mod sql;
 
 pub use error::AdapterError;
 pub use health::{Health, HealthStatus};
+pub use preview::{ApprovedWrite, ExecutionOutcome, Preview, PreviewRow, PREVIEW_SAMPLE_LIMIT};
 
-use mydb_core::Schema;
+use mydb_core::{Intent, Schema};
 
 /// What every database adapter must provide.
 ///
@@ -32,4 +35,21 @@ pub trait Adapter: Send + Sync {
     /// lightweight and strictly read-only: never a query that could be
     /// mistaken for a data-changing operation.
     async fn report_health(&self) -> Health;
+
+    /// Runs the engine's read equivalent of a write intent and returns what
+    /// the write would affect (docs/04-database-adapters.md).
+    ///
+    /// The mechanic differs per engine, which is why this is named for what
+    /// it does rather than how: a SELECT for SQL engines, a find() for
+    /// MongoDB in phase 2 (docs/17-coding-standards.md).
+    async fn build_preview(&self, intent: &Intent) -> Result<Preview, AdapterError>;
+
+    /// Runs a write the user has confirmed.
+    ///
+    /// Takes an [`ApprovedWrite`] rather than an intent. That token can only
+    /// be produced from a [`Preview`], which only an adapter can create by
+    /// actually querying the database, so there is no way to reach this
+    /// function without the user's preview having run first. See the
+    /// `preview` module for why this is a type and not a convention.
+    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError>;
 }

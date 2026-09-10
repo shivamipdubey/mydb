@@ -19,9 +19,13 @@ use crate::Engine;
 ///
 /// Phase 1 (T6) covers reads and deletes. INSERT and UPDATE arrive in T10,
 /// DROP TABLE and TRUNCATE in T11.
+///
+/// Deliberately NOT `#[non_exhaustive]`. Adding an operation should break
+/// every `match` on this type across the workspace, forcing each one to be
+/// handled on purpose. A catch-all arm is how a new destructive operation
+/// quietly inherits the behaviour of a safe one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum Operation {
     Read,
     Delete,

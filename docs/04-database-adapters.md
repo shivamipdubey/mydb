@@ -11,6 +11,16 @@ Each supported engine gets its own adapter. An adapter must implement four opera
 ### Connection details
 Set connection parameters on the driver's own configuration builder; never format them into a connection string. A password containing a space, quote, or equals sign would corrupt a hand-built string, and the resulting parse error can carry fragments of the credential into a message the user sees. This is the same reasoning as docs/16-security-and-cybersafety-checklist.md item 3, applied to connecting rather than querying.
 
+### How the preview requirement is enforced
+The preview is not a step an adapter is trusted to call. `execute` accepts only an `ApprovedWrite`, which can be produced solely by consuming a `Preview`, and a `Preview` has private fields and a crate-private constructor, so the only way to obtain one is for an adapter to have actually run a preview against the database. The intent that executes is read back out of the preview rather than passed alongside it, so the statement that runs is necessarily the one the user was shown.
+
+Executing without a preview is therefore not a mistake to catch in review. It does not compile. Any new engine adapter inherits this by implementing the same trait.
+
+The preview's WHERE clause and the write's WHERE clause are produced by the same function from the same filter, so they cannot drift apart and show one set of rows while changing another.
+
+### A preview cannot predict a constraint
+A preview reports which records match. It does not know whether the engine will accept the write: a foreign key, a check constraint, or a trigger can still refuse it. When that happens the transaction rolls back, nothing changes, and the user sees a typed error. This is a known and accepted limit, not a gap in the preview.
+
 ### What is implemented for Postgres
 Phase 1: connect, describe schema, and a read-only health check. Preview and execute for DELETE arrive in T7, INSERT and UPDATE in T10, DROP TABLE and TRUNCATE in T11. The adapter interface deliberately does not expose an execute function until the preview guard that governs it exists, so there is no window in which an adapter can execute without one.
 

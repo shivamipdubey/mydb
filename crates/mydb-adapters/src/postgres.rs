@@ -3,10 +3,14 @@
 //! Phase 1's only engine. Preview and execute arrive in T7; this module
 //! currently covers connect, describe schema, and health.
 
-use mydb_core::{Column, Schema, Table};
+use mydb_core::{Column, Intent, Operation, Schema, Table};
 use tokio_postgres::{Client, NoTls};
 
-use crate::{Adapter, AdapterError, Health};
+use crate::sql::{as_driver_params, build_where, quote_identifier, quote_table};
+use crate::{
+    Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, PreviewRow,
+    PREVIEW_SAMPLE_LIMIT,
+};
 
 /// Everything needed to reach one Postgres database.
 ///
@@ -23,8 +27,14 @@ pub struct PostgresConnectionDetails<'a> {
 }
 
 /// A live connection to a Postgres database.
+///
+/// The client sits behind a mutex because opening a transaction requires
+/// mutable access to it, while the adapter is shared across the app as `&self`.
+/// One connection per adapter is right for phase 1: a desktop app runs one
+/// user's commands one at a time, and pooling would add concurrency the
+/// confirmation workflow does not want anyway.
 pub struct PostgresAdapter {
-    client: Client,
+    client: tokio::sync::Mutex<Client>,
 }
 
 impl PostgresAdapter {
@@ -56,7 +66,9 @@ impl PostgresAdapter {
             }
         });
 
-        Ok(Self { client })
+        Ok(Self {
+            client: tokio::sync::Mutex::new(client),
+        })
     }
 }
 
@@ -117,6 +129,8 @@ impl Adapter for PostgresAdapter {
     async fn describe_schema(&self) -> Result<Schema, AdapterError> {
         let rows = self
             .client
+            .lock()
+            .await
             .query(DESCRIBE_SCHEMA_SQL, &[&SYSTEM_NAMESPACES.as_slice()])
             .await
             .map_err(describe_query_failure)?;
@@ -153,11 +167,167 @@ impl Adapter for PostgresAdapter {
         // data-changing statement (docs/13-dashboard-and-health-monitoring.md).
         match self
             .client
+            .lock()
+            .await
             .query_one("SELECT version() AS version", &[])
             .await
         {
             Ok(row) => Health::connected(row.try_get::<_, String>("version").ok()),
             Err(error) => Health::error(describe_query_failure(error).to_string()),
         }
+    }
+
+    async fn build_preview(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        match intent.operation {
+            Operation::Delete => self.preview_delete(intent).await,
+            // A read needs no preview: docs/05 step 4 runs it directly and
+            // shows the result. Reaching here means the workflow routed a
+            // read down the write path, which is a logic error worth failing
+            // loudly rather than quietly previewing.
+            Operation::Read => Err(AdapterError::Unsupported(
+                "a read does not need a preview; run it directly".to_string(),
+            )),
+        }
+    }
+
+    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError> {
+        // The intent comes out of the approved preview, never from a separate
+        // argument. What runs below is necessarily what the user was shown.
+        let intent = approved.intent();
+
+        match intent.operation {
+            Operation::Delete => self.execute_delete(intent).await,
+            Operation::Read => Err(AdapterError::Unsupported(
+                "a read is not an executable write".to_string(),
+            )),
+        }
+    }
+}
+
+impl PostgresAdapter {
+    /// Reads the column names of one table, in the table's own order.
+    ///
+    /// Needed twice over: the preview screen needs a header row, and the
+    /// SELECT below names each column explicitly rather than using `*`.
+    async fn column_names(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<Vec<String>, AdapterError> {
+        const SQL: &str = "
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_schema = $1
+               AND table_name = $2
+             ORDER BY ordinal_position
+        ";
+
+        let rows = self
+            .client
+            .lock()
+            .await
+            .query(SQL, &[&namespace, &table])
+            .await
+            .map_err(describe_query_failure)?;
+
+        if rows.is_empty() {
+            return Err(AdapterError::query(format!(
+                "no table called {table} in {namespace}"
+            )));
+        }
+
+        Ok(rows.iter().map(|row| row.get("column_name")).collect())
+    }
+
+    /// The DELETE preview: the equivalent SELECT with the same WHERE clause
+    /// (docs/04-database-adapters.md).
+    async fn preview_delete(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        let columns = self.column_names(&intent.namespace, &intent.table).await?;
+        let table = quote_table(&intent.namespace, &intent.table);
+
+        // Each column is cast to text so any column type the user happens to
+        // have can be rendered, rather than this adapter needing to decode
+        // every type Postgres supports. A preview exists to be read.
+        let projection = columns
+            .iter()
+            .map(|name| {
+                let quoted = quote_identifier(name);
+                format!("{quoted}::text AS {quoted}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let clause = build_where(&intent.filter, 1);
+        let params = as_driver_params(&clause.params);
+
+        // The exact number affected, counted independently of how many are
+        // listed. Counting the sample instead would understate a large
+        // delete, which is the case where being wrong matters most.
+        let count_sql = format!("SELECT count(*) AS affected FROM {table}{}", clause.sql);
+        let client = self.client.lock().await;
+
+        let affected_count: i64 = client
+            .query_one(&count_sql, &params)
+            .await
+            .map_err(describe_query_failure)?
+            .get("affected");
+
+        let select_sql = format!(
+            "SELECT {projection} FROM {table}{} LIMIT {PREVIEW_SAMPLE_LIMIT}",
+            clause.sql
+        );
+        let rows = client
+            .query(&select_sql, &params)
+            .await
+            .map_err(describe_query_failure)?;
+
+        let preview_rows: Vec<PreviewRow> = rows
+            .iter()
+            .map(|row| PreviewRow {
+                cells: (0..row.len())
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect(),
+            })
+            .collect();
+
+        Ok(Preview::new(
+            intent.clone(),
+            columns,
+            preview_rows,
+            affected_count.max(0) as u64,
+            select_sql,
+        ))
+    }
+
+    /// Runs a confirmed DELETE inside a transaction.
+    ///
+    /// docs/04-database-adapters.md requires the real write to be wrapped in a
+    /// transaction where the engine supports it, so a mid-statement failure
+    /// cannot leave a partial change behind.
+    async fn execute_delete(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+        let table = quote_table(&intent.namespace, &intent.table);
+
+        // Built by the same function, from the same filter, as the preview's
+        // WHERE clause. The two cannot describe different sets of rows.
+        let clause = build_where(&intent.filter, 1);
+        let params = as_driver_params(&clause.params);
+        let sql = format!("DELETE FROM {table}{}", clause.sql);
+
+        let mut client = self.client.lock().await;
+        let transaction = client.transaction().await.map_err(describe_query_failure)?;
+
+        let rows_affected = match transaction.execute(&sql, &params).await {
+            Ok(count) => count,
+            Err(error) => {
+                // Rolled back explicitly rather than by drop, so the failure
+                // path reads as deliberate.
+                let _ = transaction.rollback().await;
+                return Err(describe_query_failure(error));
+            }
+        };
+
+        transaction.commit().await.map_err(describe_query_failure)?;
+
+        Ok(ExecutionOutcome { rows_affected })
     }
 }

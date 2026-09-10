@@ -142,7 +142,7 @@ jobs:
       - name: Run integration tests
         run: |
           set -o pipefail
-          cargo test --workspace --exclude mydb-app --locked -- --ignored 2>&1 | tee integration.log
+          cargo test --workspace --exclude mydb-app --locked -- --ignored --test-threads=1 2>&1 | tee integration.log
           if ! grep -qE "test result: ok\. [1-9][0-9]* passed" integration.log; then
             echo "::error::No integration tests actually ran"
             exit 1
