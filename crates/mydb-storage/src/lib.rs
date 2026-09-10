@@ -6,16 +6,23 @@
 //! encryption that is not there. The audit log and recovery bin are phase 2.
 
 mod audit;
+mod clock;
 mod connections;
 mod database;
 mod history;
+mod recovery;
 
 pub use audit::{
     AuditEntry, AuditFilter, AuditLog, AuditRecord, SizeTier, DEFAULT_SIZE_THRESHOLD,
     LARGE_OPERATION_SAMPLE,
 };
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use connections::{Connection, ConnectionStore, ConnectionStoreError};
 pub use database::{
     default_path as database_path, open as open_database, open_in_memory, StoreError,
 };
 pub use history::{CommandHistory, HistoryEntry, HistoryError, Outcome};
+pub use recovery::{
+    NewRecoveryEntry, PurgeReport, RecoveryBin, RecoveryEntry, RecoveryFilter, StagedCapture,
+    DEFAULT_CONNECTION_CAP_BYTES, RETENTION_DAYS,
+};

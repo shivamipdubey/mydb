@@ -49,6 +49,18 @@ Before and after state are stored as engine-neutral JSON: a set of named values 
 ## recovery_bin
 id, connection id, audit_log id reference, full before state, created at, expires at (created at plus 30 days), purged flag.
 
+### As built
+A table in the same local database as the audit log, so the reference between them is a real foreign key. Columns: id, connection id, connection name, audit_log id, operation, intent summary, created at, expires at, payload, record count, payload bytes, purged, purged at, purged early.
+
+Unlike `audit_log`, this table is mutable, and deliberately so: purging is defined as clearing a payload and marking the row, not as removing it (docs/07-audit-log-and-recovery-bin.md). The reverse reference is filled in after the audit entry exists, because the audit log is append-only and cannot be updated to add it later.
+
+`connection name` is a snapshot, for the same reason as the audit log's. An entry outlives the connection it came from, and its 30-day window runs its normal course either way; nothing purges an entry early because its connection was deleted.
+
+`payload bytes` is kept after a purge so a connection's cap can be reasoned about historically. `purged early` distinguishes a cap-driven purge from an expiry, which docs/07 requires warning the user about.
+
+## recovery_staging
+staging id, record. Not part of docs/15's original list, because it holds nothing durable: records stream here while a write's transaction is open and are either finalised into a recovery entry or discarded. Anything left behind by a process that died mid-write is swept at startup, since a write whose outcome is unknown must not be offered as recoverable data.
+
 ## local_model_settings
 selected model size, detected hardware summary, override flag, download status.
 

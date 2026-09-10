@@ -38,7 +38,7 @@ pub enum StoreError {
 }
 
 /// The schema version this build expects.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Opens the local database, creating and migrating it as needed.
 pub fn open(path: impl AsRef<Path>) -> Result<Connection, StoreError> {
@@ -88,16 +88,24 @@ fn migrate(connection: &Connection, path: &Path) -> Result<(), StoreError> {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|error| fail(error.to_string()))?;
 
-    if version >= SCHEMA_VERSION {
-        return Ok(());
+    // Each step runs only if the database has not had it yet, so a file
+    // created by an older build is brought forward rather than rebuilt.
+    if version < 1 {
+        connection
+            .execute_batch(SCHEMA_V1)
+            .map_err(|error| fail(error.to_string()))?;
+    }
+    if version < 2 {
+        connection
+            .execute_batch(SCHEMA_V2)
+            .map_err(|error| fail(error.to_string()))?;
     }
 
-    connection
-        .execute_batch(SCHEMA_V1)
-        .map_err(|error| fail(error.to_string()))?;
-    connection
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
-        .map_err(|error| fail(error.to_string()))?;
+    if version < SCHEMA_VERSION {
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|error| fail(error.to_string()))?;
+    }
 
     Ok(())
 }
@@ -159,6 +167,67 @@ BEFORE DELETE ON audit_log
 BEGIN
     SELECT RAISE(ABORT, 'the audit log is append-only: entries are never deleted');
 END;
+"#;
+
+/// Version 2: the recovery bin, and the staging area a large capture streams
+/// into before it becomes a real entry.
+///
+/// Unlike the audit log, the recovery bin is mutable, and deliberately so:
+/// purging is defined as clearing an entry's payload and marking it, not as
+/// deleting the row. That keeps the audit log's reference to it resolvable
+/// forever, answering "this existed and was purged on this date" rather than
+/// pointing at nothing. It also means no audit entry ever has to be edited to
+/// record that its detail has gone, which the audit log's triggers forbid
+/// anyway.
+///
+/// `recovery_staging` exists because a large operation's before-state cannot
+/// be held in memory. Records stream into it while the write's transaction is
+/// open, and are either finalised into a real expiring entry once the write
+/// commits, or discarded if it does not. Staged rows are not recovery data:
+/// they describe a write that may never have happened.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE recovery_bin (
+    id              INTEGER PRIMARY KEY,
+    connection_id   TEXT    NOT NULL,
+    -- Snapshot, for the same reason as the audit log's: an entry outlives the
+    -- connection it came from (docs/15-data-model.md), and whether that
+    -- connection still exists is decided at read time.
+    connection_name TEXT    NOT NULL,
+    -- Set once the audit entry that describes this write has been written.
+    -- Null in between, and null for a write whose audit entry failed, rather
+    -- than claiming a reference that does not resolve.
+    audit_log_id    INTEGER REFERENCES audit_log (id),
+    operation       TEXT    NOT NULL,
+    intent_summary  TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    -- Created at plus the fixed retention window. Stored rather than computed
+    -- on read, so an entry's deadline cannot move if the retention rule ever
+    -- changes.
+    expires_at      TEXT    NOT NULL,
+    -- The full before-state. Null once purged; the row itself remains.
+    payload         TEXT,
+    record_count    INTEGER NOT NULL,
+    -- Size of the payload when it was written, kept after a purge so the
+    -- per-connection cap can be reasoned about historically.
+    payload_bytes   INTEGER NOT NULL,
+    purged          INTEGER NOT NULL DEFAULT 0,
+    purged_at       TEXT,
+    -- Set when the purge happened because the connection's cap was reached
+    -- rather than because the entry expired. docs/07 requires warning the
+    -- user about that case specifically.
+    purged_early    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX recovery_bin_connection ON recovery_bin (connection_id, created_at);
+CREATE INDEX recovery_bin_expires ON recovery_bin (expires_at) WHERE purged = 0;
+
+CREATE TABLE recovery_staging (
+    id         INTEGER PRIMARY KEY,
+    staging_id TEXT NOT NULL,
+    record     TEXT NOT NULL
+);
+
+CREATE INDEX recovery_staging_batch ON recovery_staging (staging_id, id);
 "#;
 
 /// Restricts the database file to owner read and write.

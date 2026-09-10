@@ -521,6 +521,16 @@ pub(crate) fn open_records() -> Result<rusqlite::Connection, String> {
     let path = mydb_storage::database_path().map_err(|error| error.to_string())?;
     let database = mydb_storage::open_database(&path).map_err(|error| error.to_string())?;
 
+    // A process killed mid-write leaves staged records describing a write
+    // whose outcome is unknown, and an unknown outcome must not be offered to
+    // a user as recoverable data.
+    let swept = mydb_storage::RecoveryBin::new(&database, &mydb_storage::SystemClock)
+        .sweep_staging()
+        .map_err(|error| error.to_string())?;
+    if swept > 0 {
+        log::warn!("discarded {swept} staged records left by a previous run");
+    }
+
     let log = AuditLog::new(&database);
     if log.count().map_err(|error| error.to_string())? == 0 {
         if let Ok(history) = CommandHistory::open_default() {
