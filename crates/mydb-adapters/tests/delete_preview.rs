@@ -5,7 +5,7 @@
 
 use std::sync::Mutex;
 
-use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
+use mydb_adapters::postgres::PostgresAdapter;
 use mydb_adapters::{Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview};
 use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Value};
 
