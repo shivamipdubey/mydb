@@ -11,11 +11,13 @@ mod error;
 mod health;
 pub mod postgres;
 mod preview;
+mod records;
 mod sql;
 
 pub use error::AdapterError;
 pub use health::{Health, HealthStatus};
-pub use preview::{ApprovedWrite, ExecutionOutcome, Preview, PreviewRow, PREVIEW_SAMPLE_LIMIT};
+pub use preview::{ApprovedWrite, ExecutionOutcome, Preview};
+pub use records::{Record, RecordSet, SAMPLE_LIMIT};
 
 use mydb_core::{Intent, Schema};
 
@@ -43,6 +45,13 @@ pub trait Adapter: Send + Sync {
     /// it does rather than how: a SELECT for SQL engines, a find() for
     /// MongoDB in phase 2 (docs/17-coding-standards.md).
     async fn build_preview(&self, intent: &Intent) -> Result<Preview, AdapterError>;
+
+    /// Runs a read and returns its records.
+    ///
+    /// docs/05-confirmation-workflow.md step 4: a read runs directly and its
+    /// result is shown. Reads do not need confirmation, because they change
+    /// nothing.
+    async fn run_read(&self, intent: &Intent) -> Result<RecordSet, AdapterError>;
 
     /// Runs a write the user has confirmed.
     ///

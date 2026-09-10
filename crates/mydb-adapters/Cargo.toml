@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Exposes constructors that bypass a live database, for tests in other crates.
+# The application never enables this, so no shipped build can reach them.
+test-support = []
+
 [dependencies]
 mydb-core = { workspace = true }
 serde = { workspace = true }

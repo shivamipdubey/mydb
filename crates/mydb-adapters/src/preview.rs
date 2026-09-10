@@ -20,83 +20,67 @@
 use mydb_core::Intent;
 use serde::{Deserialize, Serialize};
 
-/// How many matching records a preview lists before it starts summarising.
-///
-/// docs/12-ui-ux-guidelines.md requires affected records to be listed or
-/// clearly counted, never merely implied. Above this many, the full count is
-/// still exact; only the sample shown is capped, so a user deleting fifty
-/// thousand rows sees that number rather than a scrolling wall.
-pub const PREVIEW_SAMPLE_LIMIT: usize = 200;
-
-/// One record a write would affect, rendered for display.
-///
-/// Values are strings because this exists to be shown to a person. Cells that
-/// are SQL NULL are `None`, so the UI can distinguish an empty string from an
-/// absent value rather than printing both as blank.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreviewRow {
-    pub cells: Vec<Option<String>>,
-}
+use crate::records::{Record, RecordSet};
 
 /// What a write would do, shown to the user before anything happens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preview {
     intent: Intent,
-    columns: Vec<String>,
-    rows: Vec<PreviewRow>,
-    affected_count: u64,
-    statement: String,
-    truncated: bool,
+    affected: RecordSet,
 }
 
 impl Preview {
     /// Builds a preview. Crate-private on purpose: see the module comment.
-    pub(crate) fn new(
-        intent: Intent,
-        columns: Vec<String>,
-        rows: Vec<PreviewRow>,
-        affected_count: u64,
-        statement: String,
-    ) -> Self {
-        let truncated = (rows.len() as u64) < affected_count;
-        Self {
-            intent,
-            columns,
-            rows,
-            affected_count,
-            statement,
-            truncated,
-        }
+    pub(crate) fn new(intent: Intent, affected: RecordSet) -> Self {
+        Self { intent, affected }
+    }
+
+    /// Builds a preview without touching a database, for tests only.
+    ///
+    /// This does not weaken the guarantee above. It is behind the
+    /// `test-support` feature, which the application crate never enables, so
+    /// no shipped build can reach it. It exists because
+    /// docs/18-testing-strategy.md requires the confirmation state machine to
+    /// have unit tests, and a state machine that can only be tested against a
+    /// live database would be tested less.
+    #[cfg(feature = "test-support")]
+    pub fn for_testing(intent: Intent, affected: RecordSet) -> Self {
+        Self::new(intent, affected)
     }
 
     pub fn intent(&self) -> &Intent {
         &self.intent
     }
 
-    pub fn columns(&self) -> &[String] {
-        &self.columns
+    /// The records this write would affect.
+    pub fn affected(&self) -> &RecordSet {
+        &self.affected
     }
 
-    /// The sample of affected records, capped at [`PREVIEW_SAMPLE_LIMIT`].
-    pub fn rows(&self) -> &[PreviewRow] {
-        &self.rows
+    pub fn columns(&self) -> &[String] {
+        self.affected.columns()
+    }
+
+    /// The sample of affected records.
+    pub fn rows(&self) -> &[Record] {
+        self.affected.records()
     }
 
     /// Exactly how many records the write will affect. Never an estimate, and
     /// never just the length of the sample above.
     pub fn affected_count(&self) -> u64 {
-        self.affected_count
+        self.affected.total_count()
     }
 
     /// Whether more records are affected than are listed.
     pub fn is_truncated(&self) -> bool {
-        self.truncated
+        self.affected.is_truncated()
     }
 
     /// The read that produced this preview, for the expandable raw-syntax
     /// detail docs/12-ui-ux-guidelines.md allows as secondary information.
     pub fn statement(&self) -> &str {
-        &self.statement
+        self.affected.statement()
     }
 
     /// Whether this write would affect nothing at all.
@@ -104,7 +88,7 @@ impl Preview {
     /// Worth surfacing distinctly: a user who expected to delete something and
     /// is shown zero rows has almost certainly written the wrong filter.
     pub fn affects_nothing(&self) -> bool {
-        self.affected_count == 0
+        self.affected.is_empty()
     }
 
     /// Marks this preview as confirmed by the user, producing the token

@@ -20,5 +20,12 @@ This is the core safety loop. Every write operation, on every engine, in every p
 - Any code path that treats a "confirm all" batch shortcut as skipping the per-item preview; each item in a batch still needs its own preview shown, even if the user can confirm the batch in one action after reviewing all of them.
 - Any silent retry of a failed write without re-showing the preview.
 
+## How the sequence is enforced
+The sequence is expressed as types, not as a status field, because a status field can be ignored.
+
+Submitting a command returns either a read result or a pending write. A pending write is only ever produced by a successful preview, and is consumed by whichever of confirm, edit, or cancel the user chooses. Confirm is the only one that can execute, and it consumes the pending write, so one confirmation cannot be replayed into two executions. Edit returns a fresh pending write built from a fresh preview of the revised intent, so an edited command is looked at again before anything happens.
+
+A failed preview returns an error and no pending write at all. Step 7's rule that a failed preview must stop the workflow before confirm is therefore not a check anyone has to perform; there is simply nothing to confirm.
+
 ## Testing requirement
 docs/18-testing-strategy.md requires a test for every adapter that proves a write cannot execute without a prior preview call in the test's call log.

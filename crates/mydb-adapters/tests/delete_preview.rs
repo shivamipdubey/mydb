@@ -6,7 +6,9 @@
 use std::sync::Mutex;
 
 use mydb_adapters::postgres::PostgresAdapter;
-use mydb_adapters::{Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview};
+use mydb_adapters::{
+    Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, RecordSet,
+};
 use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Value};
 
 mod support;
@@ -214,6 +216,11 @@ impl Adapter for RecordingAdapter {
     async fn report_health(&self) -> Health {
         self.calls.lock().unwrap().push("report_health");
         self.inner.report_health().await
+    }
+
+    async fn run_read(&self, intent: &Intent) -> Result<RecordSet, AdapterError> {
+        self.calls.lock().unwrap().push("run_read");
+        self.inner.run_read(intent).await
     }
 
     async fn build_preview(&self, intent: &Intent) -> Result<Preview, AdapterError> {

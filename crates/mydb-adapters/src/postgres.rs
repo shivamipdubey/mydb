@@ -6,11 +6,9 @@
 use mydb_core::{Column, Intent, Operation, Schema, Table};
 use tokio_postgres::{Client, NoTls};
 
+use crate::records::{Record, RecordSet, SAMPLE_LIMIT};
 use crate::sql::{as_driver_params, build_where, quote_identifier, quote_table};
-use crate::{
-    Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, PreviewRow,
-    PREVIEW_SAMPLE_LIMIT,
-};
+use crate::{Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview};
 
 /// Everything needed to reach one Postgres database.
 ///
@@ -177,6 +175,10 @@ impl Adapter for PostgresAdapter {
         }
     }
 
+    async fn run_read(&self, intent: &Intent) -> Result<RecordSet, AdapterError> {
+        self.read_matching(intent).await
+    }
+
     async fn build_preview(&self, intent: &Intent) -> Result<Preview, AdapterError> {
         match intent.operation {
             Operation::Delete => self.preview_delete(intent).await,
@@ -239,15 +241,20 @@ impl PostgresAdapter {
         Ok(rows.iter().map(|row| row.get("column_name")).collect())
     }
 
-    /// The DELETE preview: the equivalent SELECT with the same WHERE clause
-    /// (docs/04-database-adapters.md).
-    async fn preview_delete(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+    /// Reads the records a filter matches, with an exact count.
+    ///
+    /// This one function serves both a read (docs/05 step 4) and the DELETE
+    /// preview (docs/04). That is deliberate: the preview for a DELETE is
+    /// defined as the equivalent SELECT with the same WHERE clause, so it
+    /// should not be a second implementation that could drift from the real
+    /// read.
+    async fn read_matching(&self, intent: &Intent) -> Result<RecordSet, AdapterError> {
         let columns = self.column_names(&intent.namespace, &intent.table).await?;
         let table = quote_table(&intent.namespace, &intent.table);
 
         // Each column is cast to text so any column type the user happens to
         // have can be rendered, rather than this adapter needing to decode
-        // every type Postgres supports. A preview exists to be read.
+        // every type Postgres supports. These records exist to be read.
         let projection = columns
             .iter()
             .map(|name| {
@@ -260,20 +267,19 @@ impl PostgresAdapter {
         let clause = build_where(&intent.filter, 1);
         let params = as_driver_params(&clause.params);
 
-        // The exact number affected, counted independently of how many are
-        // listed. Counting the sample instead would understate a large
-        // delete, which is the case where being wrong matters most.
-        let count_sql = format!("SELECT count(*) AS affected FROM {table}{}", clause.sql);
         let client = self.client.lock().await;
 
-        let affected_count: i64 = client
-            .query_one(&count_sql, &params)
+        let total_count: i64 = client
+            .query_one(
+                &format!("SELECT count(*) AS total FROM {table}{}", clause.sql),
+                &params,
+            )
             .await
             .map_err(describe_query_failure)?
-            .get("affected");
+            .get("total");
 
         let select_sql = format!(
-            "SELECT {projection} FROM {table}{} LIMIT {PREVIEW_SAMPLE_LIMIT}",
+            "SELECT {projection} FROM {table}{} LIMIT {SAMPLE_LIMIT}",
             clause.sql
         );
         let rows = client
@@ -281,22 +287,28 @@ impl PostgresAdapter {
             .await
             .map_err(describe_query_failure)?;
 
-        let preview_rows: Vec<PreviewRow> = rows
+        let records = rows
             .iter()
-            .map(|row| PreviewRow {
+            .map(|row| Record {
                 cells: (0..row.len())
                     .map(|index| row.get::<_, Option<String>>(index))
                     .collect(),
             })
             .collect();
 
-        Ok(Preview::new(
-            intent.clone(),
+        Ok(RecordSet::new(
             columns,
-            preview_rows,
-            affected_count.max(0) as u64,
+            records,
+            total_count.max(0) as u64,
             select_sql,
         ))
+    }
+
+    /// The DELETE preview: the equivalent SELECT with the same WHERE clause
+    /// (docs/04-database-adapters.md).
+    async fn preview_delete(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        let affected = self.read_matching(intent).await?;
+        Ok(Preview::new(intent.clone(), affected))
     }
 
     /// Runs a confirmed DELETE inside a transaction.
