@@ -79,6 +79,9 @@ pub enum HistoryError {
 
     #[error("could not determine a config directory for this user")]
     NoConfigDirectory,
+
+    #[error("could not import the command history into the audit log: {detail}")]
+    Import { detail: String },
 }
 
 /// The append-only command history.
@@ -210,6 +213,33 @@ impl CommandHistory {
 
     pub fn is_empty(&self) -> Result<bool, HistoryError> {
         Ok(self.len()? == 0)
+    }
+
+    /// Moves this file's entries into the audit log, then stops using it.
+    ///
+    /// The phase 1 history could never hold before or after state, so the
+    /// imported rows are flagged as predating state capture rather than
+    /// dropped: the record of what a user did stays continuous, and nobody
+    /// mistakes an old entry's absent state for a capture that failed.
+    ///
+    /// The file itself is left on disk untouched. It is append-only, and
+    /// deleting it to tidy up would destroy the only original copy of
+    /// something this import might have got wrong.
+    pub fn import_into(&self, log: &crate::AuditLog<'_>) -> Result<usize, HistoryError> {
+        let entries = self.read_all()?;
+        for entry in &entries {
+            log.import_legacy(
+                &entry.connection,
+                &entry.recorded_at,
+                &entry.operation,
+                &entry.intent,
+                entry.result,
+            )
+            .map_err(|error| HistoryError::Import {
+                detail: error.to_string(),
+            })?;
+        }
+        Ok(entries.len())
     }
 }
 
@@ -362,5 +392,73 @@ mod tests {
             "an intent summary contains the values the user typed, so another \
              account on this machine should not be able to read it"
         );
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::{AuditFilter, AuditLog};
+
+    #[test]
+    fn importing_carries_every_entry_across_and_flags_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = CommandHistory::at(dir.path().join("command-history.jsonl"));
+        history
+            .record(
+                "Local test database",
+                "delete",
+                "Delete every record in users",
+                Outcome::Success,
+            )
+            .unwrap();
+        history
+            .record(
+                "Local test database",
+                "update",
+                "Update records in users",
+                Outcome::Failure,
+            )
+            .unwrap();
+
+        let db = crate::database::open_in_memory().unwrap();
+        let log = AuditLog::new(&db);
+        assert_eq!(history.import_into(&log).unwrap(), 2);
+
+        let entries = log.list(&AuditFilter::default()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| entry.predates_state_capture));
+        // Order and outcome are preserved, not flattened to success.
+        assert!(entries.iter().any(|entry| entry.result == Outcome::Failure));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.intent_summary == "Delete every record in users"));
+    }
+
+    #[test]
+    fn importing_leaves_the_original_file_on_disk() {
+        // It is append-only, and deleting it to tidy up would destroy the
+        // only original copy of anything the import got wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let history = CommandHistory::at(dir.path().join("command-history.jsonl"));
+        history
+            .record("c", "delete", "Delete", Outcome::Success)
+            .unwrap();
+
+        let db = crate::database::open_in_memory().unwrap();
+        history.import_into(&AuditLog::new(&db)).unwrap();
+
+        assert!(history.path().exists());
+        assert_eq!(history.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn importing_an_absent_history_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = CommandHistory::at(dir.path().join("never-written.jsonl"));
+        let db = crate::database::open_in_memory().unwrap();
+        assert_eq!(history.import_into(&AuditLog::new(&db)).unwrap(), 0);
     }
 }

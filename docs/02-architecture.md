@@ -32,7 +32,7 @@ User input reaches the command parser. The parser returns a structured intent (e
 
 ## Storage on the user's machine
 - Vault: encrypted file, unlocked by a local key, recoverable only through the user's own exported recovery phrase.
-- Audit log: local database, summary entries only for large operations, full detail for small ones (docs/07-audit-log-and-recovery-bin.md).
+- Audit log: local database, summary entries only for large operations, full detail for small ones (docs/07-audit-log-and-recovery-bin.md). SQLite, bundled into the binary rather than relying on a system library, so a packaged build has no external dependency to be missing. Shares one file with the recovery bin. Phase 1's flat-file command history is imported into it and then retired.
 - Recovery bin: local database, full row detail, 30-day retention, size-capped and configurable.
 - Connection list: local config, references the vault for credentials, never stores plaintext passwords itself.
 

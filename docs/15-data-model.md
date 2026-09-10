@@ -30,6 +30,22 @@ The `audit_log` and `recovery_bin` below replace this in phase 2. This is not a 
 ## audit_log
 id, connection id, timestamp, operation type, intent summary, before state (full or reference), after state (full or reference), result (success or failure), size tier (small or large).
 
+### As built
+A table in a local SQLite database at `MYDB/mydb.sqlite3`, sharing one file with the recovery bin so an entry's reference to a recovery entry is a real foreign key rather than a number that might point at nothing. Schema changes go through a versioned migration, because this file holds the only copy of data a user may later need to recover.
+
+Columns: id, connection id, connection name, recorded at, operation, intent summary, result, size tier, affected count, before state, after state, state sample, recovery entry id, predates state capture.
+
+Three of those need explaining:
+
+- **connection name** is a snapshot taken when the write ran. docs/15's rule below says entries detach on connection deletion rather than disappearing, and the snapshot is how an entry still reads sensibly afterwards. Whether the connection still exists is decided at read time, never written into the entry, because recording it would mean editing an entry that docs/07 says is never edited.
+- **state sample** and **recovery entry id** are populated only for a large operation, where docs/07 puts full detail in the recovery bin and a sample plus a reference here. For a small operation, before state and after state hold everything and these are empty. Full detail is never in both.
+- **predates state capture** marks the rows imported from the phase 1 command history, which had no way to hold state. Flagged rather than dropped, so the record of what a user did stays continuous and nobody mistakes an old entry's absent state for a capture that failed.
+
+Append-only is enforced by triggers in the database, not by the discipline of the code that writes to it. An UPDATE or DELETE against `audit_log` aborts, so a future code path that tries cannot succeed whatever it intended. This is what makes docs/07's "nothing in it is ever edited or deleted by MYDB itself, including during a purge" true rather than merely intended.
+
+### Captured state
+Before and after state are stored as engine-neutral JSON: a set of named values per record, with each value keeping its own shape. A SQL row becomes an object of column name to value; a MongoDB document already is one, nesting included. A rectangular grid of strings was rejected deliberately, because it would flatten a document into a shape it never had, and the recovery bin is the only record of data that no longer exists.
+
 ## recovery_bin
 id, connection id, audit_log id reference, full before state, created at, expires at (created at plus 30 days), purged flag.
 
