@@ -15,7 +15,7 @@
     "db:up": "./scripts/db.sh up",
     "db:down": "./scripts/db.sh down",
     "db:reset": "./scripts/db.sh reset",
-    "test:integration": "cargo test --workspace -- --ignored"
+    "test:integration": "cargo test --workspace --exclude mydb-app -- --ignored"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

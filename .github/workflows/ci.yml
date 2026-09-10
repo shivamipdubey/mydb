@@ -131,10 +131,15 @@ jobs:
       # Integration tests are #[ignore]d so `cargo test` works without Docker.
       # This job runs them explicitly, and fails if none actually ran, so a
       # suite that quietly stops executing cannot look like a pass.
+      #
+      # mydb-app is excluded: it is the Tauri desktop shell, whose GTK system
+      # libraries are irrelevant to database integration testing and cost
+      # several minutes to install. The shell is built and tested in full by
+      # the build-and-test job on all three platforms.
       - name: Run integration tests
         run: |
           set -o pipefail
-          cargo test --workspace --locked -- --ignored 2>&1 | tee integration.log
+          cargo test --workspace --exclude mydb-app --locked -- --ignored 2>&1 | tee integration.log
           if ! grep -qE "test result: ok\. [1-9][0-9]* passed" integration.log; then
             echo "::error::No integration tests actually ran"
             exit 1
