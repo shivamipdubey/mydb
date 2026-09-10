@@ -60,6 +60,21 @@ The health check reads the server version. docs/13-dashboard-and-health-monitori
 - Preview for insertOne or insertMany: show the exact document(s) to be created.
 - Transactions: only available on replica sets; if the connection is a standalone instance, tell the user multi-document atomicity is not available before they confirm a multi-document write.
 
+### Collection-level destruction
+Two operations, previewed the same way and warned about differently, mirroring the split between DROP TABLE and TRUNCATE on a SQL engine.
+
+- Dropping a collection: preview the collection's inferred fields and its document count, with a warning that the collection itself is removed, not only its documents. The fields are inferred from a sample and must be labelled as inferred, because a document store has no declared schema to read; see the note on inferred schemas below.
+- Emptying a collection while keeping it: preview the same fields and document count, without that warning.
+
+Neither preview lists matching documents. Neither operation has a filter to match documents against, and dropping removes the collection's existence as well as its contents, so a document count alone would describe only part of what is lost. This is the same reasoning that governs a SQL schema change.
+
+A condition is refused on either operation rather than silently widened, since both apply to the whole collection.
+
+Emptying a collection removes documents one at a time under the hood, so on a standalone instance it carries the same lack of multi-document atomicity as any other multi-document write, and must say so before the user confirms. Dropping a collection is a metadata operation and does not.
+
+### Inferred schemas
+A document store has no declared schema. Field lists come from sampling documents, so they are a description of what was seen, never a guarantee of what exists. Anywhere MYDB shows or relies on a document engine's field list, it must say the list is inferred, and must not treat an unlisted field as proof that the field does not exist.
+
 ## Adding a new engine
 1. Add a section to this file describing its read equivalent for each write operation type.
 2. State explicitly whether it supports transactions, and under what configuration.
