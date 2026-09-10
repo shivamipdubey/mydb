@@ -9,10 +9,12 @@
 //! real `Intent`).
 
 mod engine;
+mod intent;
 mod schema;
 mod secret;
 
 pub use engine::Engine;
+pub use intent::{Comparison, Condition, Filter, Intent, Operation, Value};
 pub use schema::{Column, Schema, Table};
 pub use secret::{Secret, REDACTED};
 
