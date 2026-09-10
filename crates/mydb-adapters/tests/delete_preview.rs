@@ -9,7 +9,9 @@ use mydb_adapters::postgres::PostgresAdapter;
 use mydb_adapters::{
     Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, RecordSet,
 };
-use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Value};
+use mydb_core::{
+    Comparison, Condition, Engine, Filter, Intent, MemorySink, Operation, Schema, Value,
+};
 
 mod support;
 use support::{details_from_env, reset_seed};
@@ -172,7 +174,10 @@ async fn execute_removes_exactly_what_the_preview_showed() {
     let doomed = emails(&preview);
     assert_eq!(expected, 2);
 
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         outcome.rows_affected, expected,
@@ -229,9 +234,13 @@ impl Adapter for RecordingAdapter {
         self.inner.build_preview(intent).await
     }
 
-    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError> {
+    async fn execute(
+        &self,
+        approved: ApprovedWrite,
+        capture: &mut dyn mydb_core::StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError> {
         self.calls.lock().unwrap().push("execute");
-        self.inner.execute(approved).await
+        self.inner.execute(approved, capture).await
     }
 }
 
@@ -248,7 +257,10 @@ async fn execute_is_never_reached_before_a_preview_in_the_same_flow() {
         .build_preview(&delete_intent(inactive_users()))
         .await
         .unwrap();
-    recording.execute(preview.approve()).await.unwrap();
+    recording
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         recording.calls.lock().unwrap().as_slice(),
@@ -323,7 +335,10 @@ async fn an_injection_attempt_is_treated_as_data_not_syntax() {
 
     assert_eq!(preview.affected_count(), 0, "no user has that email");
 
-    adapter.execute(preview.approve()).await.unwrap();
+    adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         count_users(&adapter).await,
@@ -349,7 +364,9 @@ async fn a_write_the_database_refuses_leaves_everything_untouched() {
         .unwrap();
     assert_eq!(preview.affected_count(), 3);
 
-    let result = adapter.execute(preview.approve()).await;
+    let result = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await;
 
     assert!(
         matches!(result, Err(AdapterError::Query { .. })),

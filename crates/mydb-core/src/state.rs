@@ -196,3 +196,78 @@ mod tests {
         assert_eq!(back, state);
     }
 }
+
+/// Why a captured record could not be accepted.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("could not record captured state: {detail}")]
+pub struct SinkError {
+    pub detail: String,
+}
+
+impl SinkError {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Somewhere a capture streams to as it is read.
+///
+/// This exists so an adapter can capture a before-state larger than memory
+/// without knowing anything about where it is being kept. docs/07 requires
+/// the recovery bin to hold the full before-state of anything deleted or
+/// overwritten, at any size, and docs/17-coding-standards.md keeps the
+/// adapter layer and the recovery store as separate modules; a trait here, in
+/// the shared vocabulary, is how both stay true.
+///
+/// The adapter calls this once per record while its transaction is open, so
+/// what reaches the sink is what the write is about to change.
+pub trait StateSink: Send {
+    fn accept(&mut self, record: &RecordSnapshot) -> Result<(), SinkError>;
+}
+
+/// A sink that keeps nothing.
+///
+/// For a write with no before-state to keep, such as an insert: nothing
+/// existed, so there is nothing to recover.
+#[derive(Debug, Default)]
+pub struct NullSink;
+
+impl StateSink for NullSink {
+    fn accept(&mut self, _record: &RecordSnapshot) -> Result<(), SinkError> {
+        Ok(())
+    }
+}
+
+/// A sink that collects into memory. For tests, and for callers that know the
+/// capture is small.
+#[derive(Debug, Default)]
+pub struct MemorySink {
+    records: Vec<RecordSnapshot>,
+}
+
+impl MemorySink {
+    pub fn records(&self) -> &[RecordSnapshot] {
+        &self.records
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn into_snapshot(self) -> StateSnapshot {
+        StateSnapshot::complete(self.records)
+    }
+}
+
+impl StateSink for MemorySink {
+    fn accept(&mut self, record: &RecordSnapshot) -> Result<(), SinkError> {
+        self.records.push(record.clone());
+        Ok(())
+    }
+}

@@ -2063,6 +2063,7 @@ name = "mydb-adapters"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "mydb-core",
  "serde",
  "serde_json",

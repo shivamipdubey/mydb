@@ -21,7 +21,7 @@ pub use preview::{
 };
 pub use records::{Record, RecordSet, SAMPLE_LIMIT};
 
-use mydb_core::{Intent, Schema};
+use mydb_core::{Intent, Schema, StateSink};
 
 /// What every database adapter must provide.
 ///
@@ -62,5 +62,15 @@ pub trait Adapter: Send + Sync {
     /// actually querying the database, so there is no way to reach this
     /// function without the user's preview having run first. See the
     /// `preview` module for why this is a type and not a convention.
-    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError>;
+    /// `capture` receives every record the write is about to change, one at
+    /// a time, while the transaction is open. docs/07-audit-log-and-recovery-bin.md
+    /// requires the recovery bin to hold the full before-state at any size,
+    /// which a return value cannot carry when the operation is larger than
+    /// memory. Pass [`mydb_core::NullSink`] for a write with nothing to
+    /// recover, such as an insert.
+    async fn execute(
+        &self,
+        approved: ApprovedWrite,
+        capture: &mut dyn StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError>;
 }

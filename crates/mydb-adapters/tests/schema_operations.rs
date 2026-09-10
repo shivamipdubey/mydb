@@ -4,7 +4,7 @@
 
 use mydb_adapters::postgres::PostgresAdapter;
 use mydb_adapters::{Adapter, AdapterError, PreviewBody};
-use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Value};
+use mydb_core::{Comparison, Condition, Engine, Filter, Intent, MemorySink, Operation, Value};
 
 mod support;
 use support::{details_from_env, reset_seed};
@@ -112,7 +112,10 @@ async fn an_empty_table_previews_as_affecting_nothing() {
         .build_preview(&on("disposable", Operation::Truncate))
         .await
         .unwrap();
-    adapter.execute(preview.approve()).await.unwrap();
+    adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     let preview = adapter
         .build_preview(&on("disposable", Operation::DropTable))
@@ -136,7 +139,10 @@ async fn a_confirmed_truncate_empties_the_table_but_keeps_it() {
         .build_preview(&on("disposable", Operation::Truncate))
         .await
         .unwrap();
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         outcome.rows_affected, 3,
@@ -162,7 +168,10 @@ async fn a_confirmed_drop_removes_the_table_entirely() {
         .build_preview(&on("disposable", Operation::DropTable))
         .await
         .unwrap();
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(outcome.rows_affected, 3);
     assert!(!table_exists(&adapter, "disposable").await);
@@ -201,7 +210,9 @@ async fn a_drop_the_database_refuses_leaves_everything_standing() {
         .build_preview(&on("users", Operation::DropTable))
         .await
         .unwrap();
-    let result = adapter.execute(preview.approve()).await;
+    let result = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await;
 
     assert!(matches!(result, Err(AdapterError::Query { .. })));
     assert!(table_exists(&adapter, "users").await);
@@ -236,7 +247,10 @@ async fn a_filter_is_ignored_rather_than_narrowing_a_truncate() {
          what a truncate removes"
     );
 
-    adapter.execute(preview.approve()).await.unwrap();
+    adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
     assert_eq!(row_count(&adapter, "disposable").await, 0);
 
     reset_seed().await;

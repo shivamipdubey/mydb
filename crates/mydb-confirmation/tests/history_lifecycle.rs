@@ -14,7 +14,7 @@
 use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
 use mydb_adapters::Adapter;
 use mydb_confirmation::{begin, Step};
-use mydb_core::Engine;
+use mydb_core::{Engine, MemorySink};
 use mydb_storage::{CommandHistory, Outcome};
 
 const CONNECTION: &str = "Local test database";
@@ -81,7 +81,9 @@ async fn run_and_record(
         // A read runs directly and is not a write, so nothing is recorded.
         Step::ReadComplete(_) => Ok(false),
         Step::AwaitingConfirmation(pending) => {
-            let attempt = pending.confirm(adapter, authorization).await;
+            let attempt = pending
+                .confirm(adapter, authorization, &mut MemorySink::default())
+                .await;
             let outcome = match &attempt {
                 Ok(_) => Outcome::Success,
                 Err(_) => Outcome::Failure,

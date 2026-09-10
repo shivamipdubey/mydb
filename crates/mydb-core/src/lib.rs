@@ -18,7 +18,7 @@ pub use engine::Engine;
 pub use intent::{Assignment, Comparison, Condition, Filter, Intent, Operation, Value};
 pub use schema::{Column, Schema, Table};
 pub use secret::{Secret, REDACTED};
-pub use state::{RecordSnapshot, StateSnapshot};
+pub use state::{MemorySink, NullSink, RecordSnapshot, SinkError, StateSink, StateSnapshot};
 
 /// The phase of docs/03-phases-roadmap.md this build implements.
 ///

@@ -34,6 +34,15 @@ What survives a purge is the description: which connection, which operation, the
 
 Purged entries are excluded from the bin's listing unless explicitly asked for, since the bin is a place to recover from and these cannot be recovered from.
 
+### How a capture reaches the bin
+The adapter streams each record to a sink as it reads it, and knows nothing about the recovery bin. docs/17-coding-standards.md keeps the adapter layer and the recovery store as separate modules, and a return value cannot carry a before-state larger than memory, so the sink is how both stay true.
+
+The sink is deliberately outside the write's transaction. A sink inside it would be rolled back along with the very data it exists to preserve. The consequence is that records already streamed do not disappear when a write fails, so the caller must discard a capture whose write did not commit. That is what the staging area is for, and why a capture becomes an entry only after a commit.
+
+An insert streams nothing. It overwrites nothing, so there is nothing to recover, and an empty entry would only clutter the bin.
+
+If a capture fails partway, no entry is written at all. An entry built from a partial capture would claim to hold a before-state it does not have, and a recovery entry that is quietly incomplete is worse than a missing one.
+
 ### Capturing something too large to hold in memory
 A before-state larger than available memory streams into a staging area while the write's transaction is open, and becomes a real expiring entry only once the write has committed. If the write fails or rolls back, the staged records are discarded: they describe something that never happened, and an entry for that would be worse than no entry.
 

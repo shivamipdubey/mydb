@@ -13,7 +13,9 @@ use mydb_adapters::{
     Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, Record, RecordSet,
 };
 use mydb_confirmation::{begin, ExtraStep, Step, WorkflowError};
-use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Value};
+use mydb_core::{
+    Comparison, Condition, Engine, Filter, Intent, MemorySink, Operation, Schema, Value,
+};
 
 /// A stub adapter that records every call and can be told to fail.
 #[derive(Default)]
@@ -72,7 +74,11 @@ impl Adapter for StubAdapter {
         ))
     }
 
-    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError> {
+    async fn execute(
+        &self,
+        approved: ApprovedWrite,
+        _capture: &mut dyn mydb_core::StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError> {
         self.record("execute");
         if self.fail_execute {
             return Err(AdapterError::query("execution failed on purpose"));
@@ -161,7 +167,10 @@ async fn confirm_executes_and_reports_what_happened() {
         panic!("expected a pending write");
     };
 
-    let completed = pending.confirm(&adapter, "").await.unwrap();
+    let completed = pending
+        .confirm(&adapter, "", &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(completed.outcome.rows_affected, 1);
     assert_eq!(completed.description, "Delete every record in users");
@@ -271,7 +280,9 @@ async fn a_failed_execution_is_reported_as_an_execution_failure() {
         panic!("expected a pending write");
     };
 
-    let result = pending.confirm(&adapter, "").await;
+    let result = pending
+        .confirm(&adapter, "", &mut MemorySink::default())
+        .await;
 
     assert!(
         matches!(result, Err(WorkflowError::Execution(_))),
@@ -292,8 +303,11 @@ async fn a_confirmation_cannot_be_replayed_into_two_executions() {
         panic!("expected a pending write");
     };
 
-    pending.confirm(&adapter, "").await.unwrap();
-    // pending.confirm(&adapter, "").await; // would not compile: value moved
+    pending
+        .confirm(&adapter, "", &mut MemorySink::default())
+        .await
+        .unwrap();
+    // pending.confirm(&adapter, "", &mut MemorySink::default()).await; // would not compile: value moved
 
     assert_eq!(adapter.calls(), ["build_preview", "execute"]);
 }
@@ -341,8 +355,12 @@ impl Adapter for CountingAdapter {
             ),
         ))
     }
-    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError> {
-        self.inner.execute(approved).await
+    async fn execute(
+        &self,
+        approved: ApprovedWrite,
+        capture: &mut dyn mydb_core::StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError> {
+        self.inner.execute(approved, capture).await
     }
 }
 
@@ -375,7 +393,13 @@ async fn an_unflagged_connection_asks_for_nothing_extra() {
     ] {
         let pending = pending_for(&adapter, operation, false).await;
         assert_eq!(pending.extra_step(), &ExtraStep::None, "{operation:?}");
-        assert!(pending.confirm(&adapter, "").await.is_ok(), "{operation:?}");
+        assert!(
+            pending
+                .confirm(&adapter, "", &mut MemorySink::default())
+                .await
+                .is_ok(),
+            "{operation:?}"
+        );
     }
 }
 
@@ -393,7 +417,9 @@ async fn every_destructive_operation_is_gated_on_a_production_connection() {
         // Nothing typed: refused, and nothing ran.
         let pending = pending_for(&adapter, operation, true).await;
         assert!(pending.extra_step().is_required(), "{operation:?}");
-        let refused = pending.confirm(&adapter, "").await;
+        let refused = pending
+            .confirm(&adapter, "", &mut MemorySink::default())
+            .await;
         assert!(
             matches!(refused, Err(WorkflowError::ExtraStepNotSatisfied { .. })),
             "{operation:?} ran without its extra step"
@@ -405,7 +431,10 @@ async fn every_destructive_operation_is_gated_on_a_production_connection() {
 
         // The wrong thing typed: still refused.
         let pending = pending_for(&adapter, operation, true).await;
-        assert!(pending.confirm(&adapter, "yes please").await.is_err());
+        assert!(pending
+            .confirm(&adapter, "yes please", &mut MemorySink::default())
+            .await
+            .is_err());
         assert!(!adapter.inner.calls().contains(&"execute"));
     }
 }
@@ -423,10 +452,16 @@ async fn a_schema_change_is_gated_on_the_table_name() {
             }
         );
         // The record count is not a way past this one.
-        assert!(pending.confirm(&adapter, "42").await.is_err());
+        assert!(pending
+            .confirm(&adapter, "42", &mut MemorySink::default())
+            .await
+            .is_err());
 
         let pending = pending_for(&adapter, operation, true).await;
-        assert!(pending.confirm(&adapter, "users").await.is_ok());
+        assert!(pending
+            .confirm(&adapter, "users", &mut MemorySink::default())
+            .await
+            .is_ok());
     }
 }
 
@@ -439,11 +474,17 @@ async fn a_large_delete_accepts_the_count_or_the_word() {
         pending.extra_step(),
         &ExtraStep::CountOrConfirm { count: 42 }
     );
-    assert!(pending.confirm(&adapter, "42").await.is_ok());
+    assert!(pending
+        .confirm(&adapter, "42", &mut MemorySink::default())
+        .await
+        .is_ok());
 
     let adapter = counting(42);
     let pending = pending_for(&adapter, Operation::Update, true).await;
-    assert!(pending.confirm(&adapter, "CONFIRM").await.is_ok());
+    assert!(pending
+        .confirm(&adapter, "CONFIRM", &mut MemorySink::default())
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -454,13 +495,19 @@ async fn a_delete_of_one_record_will_not_accept_the_count() {
         assert_eq!(pending.extra_step(), &ExtraStep::ConfirmWord);
 
         assert!(
-            pending.confirm(&adapter, &count.to_string()).await.is_err(),
+            pending
+                .confirm(&adapter, &count.to_string(), &mut MemorySink::default())
+                .await
+                .is_err(),
             "typing {count} is a keystroke, not friction"
         );
         assert!(!adapter.inner.calls().contains(&"execute"));
 
         let pending = pending_for(&adapter, Operation::Delete, true).await;
-        assert!(pending.confirm(&adapter, "confirm").await.is_ok());
+        assert!(pending
+            .confirm(&adapter, "confirm", &mut MemorySink::default())
+            .await
+            .is_ok());
     }
 }
 
@@ -469,7 +516,10 @@ async fn an_insert_on_a_production_connection_needs_no_extra_step() {
     let adapter = counting(1);
     let pending = pending_for(&adapter, Operation::Insert, true).await;
     assert_eq!(pending.extra_step(), &ExtraStep::None);
-    assert!(pending.confirm(&adapter, "").await.is_ok());
+    assert!(pending
+        .confirm(&adapter, "", &mut MemorySink::default())
+        .await
+        .is_ok());
 }
 
 #[tokio::test]

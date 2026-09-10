@@ -19,7 +19,7 @@ pub use error::WorkflowError;
 pub use extra_step::{ExtraStep, CONFIRM_WORD};
 
 use mydb_adapters::{Adapter, ExecutionOutcome, Preview, RecordSet};
-use mydb_core::Intent;
+use mydb_core::{Intent, StateSink};
 
 /// Where a command lands after being submitted.
 #[derive(Debug)]
@@ -140,10 +140,17 @@ impl PendingWrite {
     /// checked here, in the engine, and not only wherever the interface
     /// happens to disable a button: a gate enforced solely in the interface
     /// is not a gate.
+    ///
+    /// `capture` receives the records this write is about to change, so they
+    /// can reach the recovery bin before they are gone
+    /// (docs/07-audit-log-and-recovery-bin.md). The engine passes it straight
+    /// through: what to do with a capture is the storage layer's business,
+    /// not this module's (docs/17-coding-standards.md).
     pub async fn confirm(
         self,
         adapter: &dyn Adapter,
         authorization: &str,
+        capture: &mut dyn StateSink,
     ) -> Result<Completed, WorkflowError> {
         if !self.extra_step.accepts(authorization) {
             return Err(WorkflowError::ExtraStepNotSatisfied {
@@ -156,7 +163,7 @@ impl PendingWrite {
 
         let description = self.description();
         let outcome = adapter
-            .execute(self.preview.approve())
+            .execute(self.preview.approve(), capture)
             .await
             .map_err(WorkflowError::Execution)?;
         Ok(Completed {

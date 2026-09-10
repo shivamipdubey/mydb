@@ -13,6 +13,7 @@ use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
 use mydb_adapters::Adapter;
 use mydb_confirmation::{begin, Step, WorkflowError};
 use mydb_core::Engine;
+use mydb_core::MemorySink;
 
 fn details() -> PostgresConnectionDetails<'static> {
     fn var(name: &str, default: &'static str) -> &'static str {
@@ -115,7 +116,10 @@ async fn typed_command_to_confirmed_delete_works_end_to_end() {
     let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, false).await.unwrap() else {
         panic!("a delete must await confirmation");
     };
-    let completed = pending.confirm(&adapter, "").await.unwrap();
+    let completed = pending
+        .confirm(&adapter, "", &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(completed.outcome.rows_affected, 2);
     assert_eq!(user_count(&adapter, &schema).await, 5);
@@ -194,7 +198,9 @@ async fn a_production_delete_will_not_run_until_its_gate_is_satisfied() {
     };
     assert_eq!(pending.preview().affected_count(), 2);
 
-    let refused = pending.confirm(&adapter, "").await;
+    let refused = pending
+        .confirm(&adapter, "", &mut MemorySink::default())
+        .await;
     assert!(
         matches!(refused, Err(WorkflowError::ExtraStepNotSatisfied { .. })),
         "an unsatisfied gate must stop the write"
@@ -215,7 +221,10 @@ async fn a_production_delete_will_not_run_until_its_gate_is_satisfied() {
     let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, true).await.unwrap() else {
         panic!("expected a pending write");
     };
-    let completed = pending.confirm(&adapter, "2").await.unwrap();
+    let completed = pending
+        .confirm(&adapter, "2", &mut MemorySink::default())
+        .await
+        .unwrap();
     assert_eq!(completed.outcome.rows_affected, 2);
     assert_eq!(user_count(&adapter, &schema).await, 5);
 
@@ -235,7 +244,10 @@ async fn a_production_drop_is_gated_on_the_table_name() {
     };
 
     // The row count is not a way past a schema change's gate.
-    assert!(pending.confirm(&adapter, "3").await.is_err());
+    assert!(pending
+        .confirm(&adapter, "3", &mut MemorySink::default())
+        .await
+        .is_err());
     assert!(
         adapter
             .describe_schema()
@@ -250,7 +262,10 @@ async fn a_production_drop_is_gated_on_the_table_name() {
     let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, true).await.unwrap() else {
         panic!("expected a pending write");
     };
-    pending.confirm(&adapter, "disposable").await.unwrap();
+    pending
+        .confirm(&adapter, "disposable", &mut MemorySink::default())
+        .await
+        .unwrap();
     assert!(adapter
         .describe_schema()
         .await

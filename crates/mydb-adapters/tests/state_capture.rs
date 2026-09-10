@@ -6,7 +6,8 @@
 use mydb_adapters::postgres::PostgresAdapter;
 use mydb_adapters::{Adapter, AdapterError};
 use mydb_core::{
-    Assignment, Comparison, Condition, Engine, Filter, Intent, Operation, StateSnapshot, Value,
+    Assignment, Comparison, Condition, Engine, Filter, Intent, MemorySink, Operation,
+    StateSnapshot, Value,
 };
 
 mod support;
@@ -41,7 +42,10 @@ fn by_id(id: i64) -> Filter {
 
 async fn run(adapter: &PostgresAdapter, intent: Intent) -> mydb_adapters::ExecutionOutcome {
     let preview = adapter.build_preview(&intent).await.unwrap();
-    adapter.execute(preview.approve()).await.unwrap()
+    adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap()
 }
 
 // --- a delete: the records existed, and afterwards they do not ---
@@ -288,12 +292,175 @@ async fn a_write_the_database_refuses_captures_nothing() {
     // Deleting user 1 orphans rows in orders, so the transaction rolls back.
     let intent = on("users", Operation::Delete, by_id(1), Vec::new());
     let preview = adapter.build_preview(&intent).await.unwrap();
-    let result = adapter.execute(preview.approve()).await;
+    let result = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await;
 
     assert!(matches!(result, Err(AdapterError::Query { .. })));
 
     // And the row is still there: the capture was inside the transaction and
     // went back with it.
+    let still_there = adapter
+        .run_read(&on("users", Operation::Read, by_id(1), Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(still_there.total_count(), 1);
+
+    reset_seed().await;
+}
+
+// --- streaming, for a capture larger than memory (docs/07) ---
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn every_record_reaches_the_sink_however_many_there_are() {
+    // docs/07 requires the recovery bin to hold the full before-state
+    // "regardless of operation size", while the audit log holds full detail
+    // only for a small operation. So the sink gets everything and the
+    // returned snapshot is bounded.
+    reset_seed().await;
+    let adapter = adapter().await;
+
+    let intent = on("bulk", Operation::Delete, Filter::everything(), Vec::new());
+    let preview = adapter.build_preview(&intent).await.unwrap();
+    assert_eq!(preview.affected_count(), 2_500);
+
+    let mut sink = MemorySink::default();
+    let outcome = adapter.execute(preview.approve(), &mut sink).await.unwrap();
+
+    assert_eq!(outcome.rows_affected, 2_500);
+    assert_eq!(
+        sink.len(),
+        2_500,
+        "the recovery bin must receive every record, not a sample"
+    );
+    assert_eq!(
+        outcome.before.records().len(),
+        mydb_adapters::STATE_CAPTURE_LIMIT,
+        "what is held in memory for the audit log stays bounded"
+    );
+    assert_eq!(
+        outcome.before.total(),
+        2_500,
+        "and the count is still the real one"
+    );
+    assert!(outcome.before.is_sample());
+
+    reset_seed().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn an_insert_streams_nothing_because_nothing_existed() {
+    reset_seed().await;
+    let adapter = adapter().await;
+
+    let intent = on(
+        "disposable",
+        Operation::Insert,
+        Filter::everything(),
+        vec![
+            Assignment {
+                column: "id".to_string(),
+                value: Value::Integer(11),
+            },
+            Assignment {
+                column: "label".to_string(),
+                value: Value::Text("Eleventh".to_string()),
+            },
+        ],
+    );
+    let preview = adapter.build_preview(&intent).await.unwrap();
+
+    let mut sink = MemorySink::default();
+    adapter.execute(preview.approve(), &mut sink).await.unwrap();
+
+    assert!(
+        sink.is_empty(),
+        "an insert overwrites nothing, so there is nothing to recover"
+    );
+
+    reset_seed().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn an_update_streams_the_records_it_is_about_to_change() {
+    reset_seed().await;
+    let adapter = adapter().await;
+
+    let intent = on(
+        "users",
+        Operation::Update,
+        by_id(2),
+        vec![Assignment {
+            column: "active".to_string(),
+            value: Value::Boolean(false),
+        }],
+    );
+    let preview = adapter.build_preview(&intent).await.unwrap();
+
+    let mut sink = MemorySink::default();
+    adapter.execute(preview.approve(), &mut sink).await.unwrap();
+
+    assert_eq!(sink.len(), 1);
+    assert_eq!(
+        sink.records()[0].get("active").unwrap(),
+        &serde_json::json!(true),
+        "the sink must hold the values as they were, not as they became"
+    );
+
+    reset_seed().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn a_schema_change_streams_the_whole_table() {
+    reset_seed().await;
+    let adapter = adapter().await;
+
+    let intent = on(
+        "disposable",
+        Operation::DropTable,
+        Filter::everything(),
+        Vec::new(),
+    );
+    let preview = adapter.build_preview(&intent).await.unwrap();
+
+    let mut sink = MemorySink::default();
+    adapter.execute(preview.approve(), &mut sink).await.unwrap();
+
+    assert_eq!(sink.len(), 3, "everything the drop destroyed");
+
+    reset_seed().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn a_failed_write_still_reaches_the_sink_which_is_why_the_caller_discards() {
+    // The sink is outside the write's transaction, so records it has already
+    // accepted do not roll back with the write. That is deliberate: a sink
+    // inside the transaction would be rolled back along with the data it was
+    // meant to preserve. The caller is therefore responsible for discarding
+    // a capture whose write failed, which is what StagingSink::discard does
+    // and what the storage tests cover.
+    reset_seed().await;
+    let adapter = adapter().await;
+
+    let intent = on("users", Operation::Delete, by_id(1), Vec::new());
+    let preview = adapter.build_preview(&intent).await.unwrap();
+
+    let mut sink = MemorySink::default();
+    let result = adapter.execute(preview.approve(), &mut sink).await;
+
+    assert!(matches!(result, Err(AdapterError::Query { .. })));
+    assert_eq!(
+        sink.len(),
+        1,
+        "the record was streamed before the write was refused"
+    );
+
+    // The database itself is untouched, which is the part that matters.
     let still_there = adapter
         .run_read(&on("users", Operation::Read, by_id(1), Vec::new()))
         .await

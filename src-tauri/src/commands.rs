@@ -16,6 +16,7 @@ use crate::dto::{
     ActiveConnectionInfo, ColumnView, CommandOutcome, ConnectionInput, ConnectionSummary,
     ExecutionSummary, ExtraStepView, PreviewView, RecordsView, TableSummary, TableView,
 };
+use crate::recording::StagingSink;
 use crate::state::{ActiveConnection, AppState};
 
 /// An error the interface can display.
@@ -379,8 +380,24 @@ pub async fn confirm_command(
 
     // Kept before confirming, which consumes the pending write.
     let intent = pending.intent().clone();
+    let destructive = intent.is_destructive();
+
+    // docs/07-audit-log-and-recovery-bin.md: the recovery bin holds the full
+    // before-state of anything deleted or overwritten. An insert overwrites
+    // nothing, so it captures nothing rather than storing an empty entry.
+    let mut staging = if destructive {
+        Some(StagingSink::begin(state.records.clone())?)
+    } else {
+        None
+    };
+    let mut discard = mydb_core::NullSink;
+    let capture: &mut dyn mydb_core::StateSink = match staging.as_mut() {
+        Some(sink) => sink,
+        None => &mut discard,
+    };
+
     let attempt = pending
-        .confirm(active.adapter.as_ref(), &authorization)
+        .confirm(active.adapter.as_ref(), &authorization, capture)
         .await;
 
     // Recorded after the attempt finished, whichever way it went, and never
@@ -411,6 +428,27 @@ pub async fn confirm_command(
     let connection_name = active.name.clone();
     drop(active_guard);
 
+    // The capture becomes a recovery entry only now, after the write has
+    // committed. A failed write's staged records are thrown away: they
+    // describe something that never happened.
+    let mut recovery_entry_id = None;
+    let mut recovery_problem = None;
+    if let Some(sink) = staging {
+        if attempt.is_ok() {
+            match sink.finalize(
+                &connection_id,
+                &connection_name,
+                intent.operation.verb(),
+                &intent.describe(),
+            ) {
+                Ok(id) => recovery_entry_id = id,
+                Err(problem) => recovery_problem = Some(problem),
+            }
+        } else if let Err(problem) = sink.discard() {
+            recovery_problem = Some(problem);
+        }
+    }
+
     let recorded = record_audit(
         &state,
         AttemptedWrite {
@@ -421,6 +459,7 @@ pub async fn confirm_command(
             affected_count: affected,
             before,
             after,
+            recovery_entry_id,
         },
     )
     .await;
@@ -433,7 +472,7 @@ pub async fn confirm_command(
         // The write ran. A record store that could not be written is worth
         // telling the user about, but it must not be reported as the write
         // having failed; that would be the worse lie.
-        record_warning: recorded.err(),
+        record_warning: recorded.err().or(recovery_problem),
     })
 }
 
@@ -465,6 +504,10 @@ struct AttemptedWrite<'a> {
     /// `None` when the after-state could not be captured, which is not the
     /// same as it having been empty.
     after: Option<mydb_core::StateSnapshot>,
+    /// The recovery entry holding this write's full before-state, when there
+    /// is one. For a large operation this is where the detail lives that the
+    /// audit entry only samples (docs/07).
+    recovery_entry_id: Option<i64>,
 }
 
 /// Appends one entry to the audit log (docs/07-audit-log-and-recovery-bin.md).
@@ -481,17 +524,18 @@ async fn record_audit(state: &AppState, attempt: AttemptedWrite<'_>) -> Result<(
         affected_count,
         before,
         after,
+        recovery_entry_id,
     } = attempt;
 
-    let mut guard = state.records.lock().await;
-    if guard.is_none() {
-        *guard = Some(open_records()?);
-    }
+    let guard = state
+        .records
+        .lock()
+        .map_err(|_| "the local record store is in an inconsistent state".to_string())?;
     let database = guard
         .as_ref()
         .ok_or_else(|| "the local record store is unavailable".to_string())?;
 
-    AuditLog::new(database)
+    let entry = AuditLog::new(database)
         .append(AuditRecord {
             connection_id,
             connection_name,
@@ -504,10 +548,21 @@ async fn record_audit(state: &AppState, attempt: AttemptedWrite<'_>) -> Result<(
             // after-state would read as "the records vanished", so the log
             // holds nothing there and the viewer says why.
             after: after.unwrap_or_else(mydb_core::StateSnapshot::empty),
-            recovery_entry_id: None,
+            recovery_entry_id,
         })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    // The reference runs both ways, and this is the direction that can be
+    // filled in afterwards: the audit log is append-only, so it cannot be
+    // updated later to point at the recovery entry, while the recovery bin
+    // can be updated to point back.
+    if let Some(recovery_id) = recovery_entry_id {
+        mydb_storage::RecoveryBin::new(database, &mydb_storage::SystemClock)
+            .link_audit_entry(recovery_id, entry.id)
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(())
 }
 
 /// Opens the local record store, importing phase 1's command history the

@@ -15,6 +15,7 @@ mydb-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 serde_json = { workspace = true }

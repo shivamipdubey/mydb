@@ -32,7 +32,12 @@ pub struct AppState {
     /// Only ever one: a second command replaces it, which is correct, because
     /// a preview the user has moved on from should not remain confirmable.
     pub pending: Mutex<Option<PendingWrite>>,
-    /// The local database holding the audit log and, from T3, the recovery
-    /// bin. Opened once and kept, since every confirmed write appends to it.
-    pub records: Mutex<Option<rusqlite::Connection>>,
+    /// The local database holding the audit log and the recovery bin.
+    ///
+    /// Shared rather than owned by one place: a write's capture streams into
+    /// it from the sink handed to the adapter, while the audit entry is
+    /// appended from the command that ran the write. A standard mutex rather
+    /// than an async one, because every critical section here is a single
+    /// statement and the guard is never held across an await.
+    pub records: crate::recording::Records,
 }

@@ -54,3 +54,16 @@ INSERT INTO disposable (id, label, note) VALUES
     (1, 'first',  NULL),
     (2, 'second', 'has a note'),
     (3, 'third',  NULL);
+
+-- A table larger than the in-memory capture limit, so the streaming path in
+-- docs/07 can be exercised: the recovery bin must hold every record however
+-- many there are, while the audit log keeps only a bounded sample.
+DROP TABLE IF EXISTS bulk;
+
+CREATE TABLE bulk (
+    id    integer PRIMARY KEY,
+    label text    NOT NULL
+);
+
+INSERT INTO bulk (id, label)
+SELECT n, 'row ' || n FROM generate_series(1, 2500) AS s(n);

@@ -4,7 +4,9 @@
 
 use mydb_adapters::postgres::PostgresAdapter;
 use mydb_adapters::{Adapter, AdapterError};
-use mydb_core::{Assignment, Comparison, Condition, Engine, Filter, Intent, Operation, Value};
+use mydb_core::{
+    Assignment, Comparison, Condition, Engine, Filter, Intent, MemorySink, Operation, Value,
+};
 
 mod support;
 use support::{details_from_env, reset_seed};
@@ -142,7 +144,10 @@ async fn insert_executes_only_after_its_preview_and_stores_the_value_verbatim() 
 
     let create = intent(Operation::Insert, Filter::everything(), new_user());
     let preview = adapter.build_preview(&create).await.unwrap();
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(outcome.rows_affected, 1);
     assert_eq!(total_users(&adapter).await, 8);
@@ -201,7 +206,10 @@ async fn update_executes_only_the_records_it_previewed() {
         vec![assignment("active", Value::Boolean(false))],
     );
     let preview = adapter.build_preview(&change).await.unwrap();
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(outcome.rows_affected, 1);
     assert_eq!(
@@ -233,7 +241,10 @@ async fn update_writes_values_of_every_type_correctly() {
         ],
     );
     let preview = adapter.build_preview(&change).await.unwrap();
-    adapter.execute(preview.approve()).await.unwrap();
+    adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         cell(&adapter, by_id(4), "full_name").await.as_deref(),
@@ -272,7 +283,10 @@ async fn an_update_found_case_insensitively_updates_the_right_record() {
 
     let preview = adapter.build_preview(&change).await.unwrap();
     assert_eq!(preview.affected_count(), 1);
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
     assert_eq!(
         outcome.rows_affected, 1,
         "the update must match the same record the preview matched"
@@ -344,7 +358,9 @@ async fn a_rejected_insert_leaves_the_table_untouched() {
     );
 
     let preview = adapter.build_preview(&clash).await.unwrap();
-    let result = adapter.execute(preview.approve()).await;
+    let result = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await;
 
     assert!(matches!(result, Err(AdapterError::Query { .. })));
     assert_eq!(
@@ -368,7 +384,10 @@ async fn an_injection_attempt_in_a_written_value_is_stored_as_text() {
     );
 
     let preview = adapter.build_preview(&change).await.unwrap();
-    adapter.execute(preview.approve()).await.unwrap();
+    adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
 
     assert_eq!(
         cell(&adapter, by_id(7), "full_name").await.as_deref(),

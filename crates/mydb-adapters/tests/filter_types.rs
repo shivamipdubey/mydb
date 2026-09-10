@@ -5,7 +5,7 @@
 
 use mydb_adapters::postgres::PostgresAdapter;
 use mydb_adapters::Adapter;
-use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Value};
+use mydb_core::{Comparison, Condition, Engine, Filter, Intent, MemorySink, Operation, Value};
 
 mod support;
 use support::{details_from_env, reset_seed};
@@ -197,7 +197,10 @@ async fn a_delete_matched_case_insensitively_removes_exactly_the_previewed_row()
     let preview = adapter.build_preview(&intent).await.unwrap();
     assert_eq!(preview.affected_count(), 1);
 
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
     assert_eq!(
         outcome.rows_affected, 1,
         "execute must match the same row the preview matched, or the two \
@@ -243,7 +246,10 @@ async fn a_delete_on_an_integer_column_previews_and_executes() {
     let preview = adapter.build_preview(&intent).await.unwrap();
     assert_eq!(preview.affected_count(), 1);
 
-    let outcome = adapter.execute(preview.approve()).await.unwrap();
+    let outcome = adapter
+        .execute(preview.approve(), &mut MemorySink::default())
+        .await
+        .unwrap();
     assert_eq!(outcome.rows_affected, 1);
 
     reset_seed().await;

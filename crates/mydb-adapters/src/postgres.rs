@@ -7,7 +7,8 @@
 //! (docs/07-audit-log-and-recovery-bin.md).
 
 use mydb_core::{
-    Assignment, Column, Intent, Operation, RecordSnapshot, Schema, StateSnapshot, Table, Value,
+    Assignment, Column, Intent, Operation, RecordSnapshot, Schema, StateSink, StateSnapshot, Table,
+    Value,
 };
 use tokio_postgres::{Client, NoTls};
 
@@ -210,21 +211,27 @@ impl Adapter for PostgresAdapter {
         }
     }
 
-    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError> {
+    async fn execute(
+        &self,
+        approved: ApprovedWrite,
+        capture: &mut dyn StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError> {
         // The intent comes out of the approved preview, never from a separate
         // argument. What runs below is necessarily what the user was shown.
         let intent = approved.intent();
 
         match intent.operation {
-            Operation::Delete => self.execute_delete(intent).await,
-            Operation::Update => self.execute_update(intent).await,
+            Operation::Delete => self.execute_delete(intent, capture).await,
+            Operation::Update => self.execute_update(intent, capture).await,
+            // Nothing existed before an insert, so there is nothing to
+            // capture and the sink is deliberately left untouched.
             Operation::Insert => self.execute_insert(intent).await,
             // A schema operation destroys everything in the table, so the
             // count it reports is the one the user was shown in the preview.
             // Postgres reports no affected rows for DDL, and saying "0
             // records" after emptying a table would be plainly wrong.
             Operation::DropTable | Operation::Truncate => {
-                self.execute_schema_change(intent, approved.preview().affected_count())
+                self.execute_schema_change(intent, approved.preview().affected_count(), capture)
                     .await
             }
             Operation::Read => Err(AdapterError::Unsupported(
@@ -362,7 +369,11 @@ impl PostgresAdapter {
     /// delete. Reading the rows in a separate statement beforehand would
     /// leave a gap in which they could change, and the recovery bin would
     /// then hold something that was never what the delete actually removed.
-    async fn execute_delete(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+    async fn execute_delete(
+        &self,
+        intent: &Intent,
+        capture: &mut dyn StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError> {
         let shape = self
             .describe_table(&intent.namespace, &intent.table)
             .await?;
@@ -379,7 +390,8 @@ impl PostgresAdapter {
         let mut client = self.client.lock().await;
         let transaction = client.transaction().await.map_err(describe_query_failure)?;
 
-        let before = match capture(&transaction, &table, &clause.sql, &params).await {
+        let before = match stream_capture(&transaction, &table, &clause.sql, &params, capture).await
+        {
             Ok(before) => before,
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -450,7 +462,11 @@ impl PostgresAdapter {
     /// filter may no longer match: "set active to false where active is
     /// true" matches nothing once it has run, and re-reading by filter would
     /// record that the rows had disappeared.
-    async fn execute_update(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+    async fn execute_update(
+        &self,
+        intent: &Intent,
+        capture: &mut dyn StateSink,
+    ) -> Result<ExecutionOutcome, AdapterError> {
         let shape = self
             .describe_table(&intent.namespace, &intent.table)
             .await?;
@@ -477,7 +493,14 @@ impl PostgresAdapter {
         let mut client = self.client.lock().await;
         let transaction = client.transaction().await.map_err(describe_query_failure)?;
 
-        let before = match capture(&transaction, &table, &capture_clause.sql, &capture_params).await
+        let before = match stream_capture(
+            &transaction,
+            &table,
+            &capture_clause.sql,
+            &capture_params,
+            capture,
+        )
+        .await
         {
             Ok(before) => before,
             Err(error) => {
@@ -529,6 +552,7 @@ impl PostgresAdapter {
         &self,
         intent: &Intent,
         previewed_rows: u64,
+        capture: &mut dyn StateSink,
     ) -> Result<ExecutionOutcome, AdapterError> {
         // Confirms the table exists and gives the same clear error as every
         // other operation when it does not.
@@ -553,7 +577,7 @@ impl PostgresAdapter {
         let mut client = self.client.lock().await;
         let transaction = client.transaction().await.map_err(describe_query_failure)?;
 
-        let before = match capture(&transaction, &table, "", &[]).await {
+        let before = match stream_capture(&transaction, &table, "", &[], capture).await {
             Ok(before) => before,
             Err(error) => {
                 let _ = transaction.rollback().await;
@@ -629,16 +653,25 @@ fn snapshot_from(row: &tokio_postgres::Row) -> Option<RecordSnapshot> {
     }
 }
 
-/// Captures the records a filter matches, with an exact count.
+/// Streams the records a write is about to change, with an exact count.
+///
+/// Every record goes to the sink, one at a time, so a before-state larger
+/// than memory still reaches the recovery bin in full, as docs/07 requires.
+/// Only a bounded sample is kept in memory, for the audit log: docs/07 puts
+/// full detail in the log for a small operation and a sample plus a
+/// reference for a large one, so the log never needs the whole thing.
 ///
 /// `where_sql` is either a rendered WHERE clause or empty, in which case the
 /// whole table is captured, which is what a drop or truncate destroys.
-async fn capture(
+async fn stream_capture(
     transaction: &tokio_postgres::Transaction<'_>,
     table: &str,
     where_sql: &str,
     params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    sink: &mut dyn StateSink,
 ) -> Result<StateSnapshot, AdapterError> {
+    use futures_util::{pin_mut, TryStreamExt};
+
     let total: i64 = transaction
         .query_one(
             &format!("SELECT count(*) AS total FROM {table} AS t{where_sql}"),
@@ -648,18 +681,30 @@ async fn capture(
         .map_err(describe_query_failure)?
         .get("total");
 
-    let rows = transaction
-        .query(
-            &format!(
-                "SELECT to_jsonb(t) AS record FROM {table} AS t{where_sql} LIMIT {STATE_CAPTURE_LIMIT}"
-            ),
-            params,
+    // query_raw rather than query: it yields rows as they arrive instead of
+    // collecting them all first, which is the whole point when the set is
+    // larger than memory.
+    let stream = transaction
+        .query_raw(
+            &format!("SELECT to_jsonb(t) AS record FROM {table} AS t{where_sql}"),
+            params.iter().copied(),
         )
         .await
         .map_err(describe_query_failure)?;
+    pin_mut!(stream);
 
-    let records: Vec<RecordSnapshot> = rows.iter().filter_map(snapshot_from).collect();
-    Ok(StateSnapshot::sample(records, total.max(0) as u64))
+    let mut kept: Vec<RecordSnapshot> = Vec::new();
+    while let Some(row) = stream.try_next().await.map_err(describe_query_failure)? {
+        if let Some(snapshot) = snapshot_from(&row) {
+            sink.accept(&snapshot)
+                .map_err(|error| AdapterError::query(error.to_string()))?;
+            if kept.len() < STATE_CAPTURE_LIMIT {
+                kept.push(snapshot);
+            }
+        }
+    }
+
+    Ok(StateSnapshot::sample(kept, total.max(0) as u64))
 }
 
 /// Re-reads records by their primary key values.

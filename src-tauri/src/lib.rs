@@ -7,6 +7,7 @@
 
 mod commands;
 mod dto;
+mod recording;
 mod state;
 
 /// Returns the roadmap phase this build implements.
@@ -28,11 +29,10 @@ pub fn run() {
             // A failure here must not stop the app: the record store matters,
             // but not more than being able to run at all.
             match commands::open_records() {
-                Ok(database) => {
-                    if let Ok(mut guard) = app.state::<state::AppState>().records.try_lock() {
-                        *guard = Some(database);
-                    }
-                }
+                Ok(database) => match app.state::<state::AppState>().records.lock() {
+                    Ok(mut guard) => *guard = Some(database),
+                    Err(_) => log::error!("the local record store lock is poisoned at startup"),
+                },
                 Err(problem) => log::warn!("could not open the local record store: {problem}"),
             }
 

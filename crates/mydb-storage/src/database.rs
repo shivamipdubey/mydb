@@ -80,8 +80,15 @@ fn migrate(connection: &Connection, path: &Path) -> Result<(), StoreError> {
         detail,
     };
 
+    // WAL, because a write's capture streams in from one place while the
+    // audit entry is appended from another; the default journal makes those
+    // contend. busy_timeout so a brief overlap waits rather than failing.
     connection
-        .execute_batch("PRAGMA foreign_keys = ON;")
+        .execute_batch(
+            "PRAGMA foreign_keys = ON;\n\
+             PRAGMA journal_mode = WAL;\n\
+             PRAGMA busy_timeout = 5000;",
+        )
         .map_err(|error| fail(error.to_string()))?;
 
     let version: i64 = connection
