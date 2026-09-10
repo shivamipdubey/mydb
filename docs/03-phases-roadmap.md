@@ -11,6 +11,7 @@ Work one phase at a time. Do not begin a phase until the previous one passes its
 - Credentials stored in a plain local config file. The vault comes later.
 - No audit log detail requirements yet beyond a basic command history.
 - Package the macOS build. macOS packaging is a phase 1 deliverable, stated here explicitly so it is not left implied by phase 3's wording.
+- Set up cross-platform continuous integration: build and test on Windows, macOS, and Linux on every commit. This lands in phase 1, not phase 3, because development happens on macOS only and breakage on the other two platforms should surface as it is introduced rather than accumulate. Phase 3 still owns packaging and hands-on testing for those platforms (docs/18-testing-strategy.md records what CI can and cannot verify on each).
 
 ## Phase 2: Database breadth
 - Add MongoDB.

@@ -29,3 +29,14 @@
 
 ## Test types
 Use unit tests for individual adapter functions and the confirmation state machine. Use integration tests against real or containerized database instances for adapter correctness. Use end-to-end tests for the full command-to-confirm-to-execute flow on the UI.
+
+## Where each suite runs
+Continuous integration builds and tests on Windows, macOS, and Linux on every commit, using standard GitHub-hosted runners. Development happens on macOS only, so the matrix exists to catch breakage on the other two platforms as it happens rather than at phase 3.
+
+- Unit tests (Rust and frontend), lint, and the full build: all three platforms.
+- Integration tests against containerized Postgres: Linux only. GitHub-hosted macOS runners have no Docker daemon and Windows runners only run Windows containers, so a Postgres service container cannot start on either. Adapter integration correctness is therefore verified on Linux in CI and on the developer's machine locally.
+- End-to-end UI tests through `tauri-driver`: Linux only. WKWebView exposes no WebDriver interface, so Tauri's driver cannot run on macOS at all. This is a known cost of the stack chosen in docs/02-architecture.md.
+- End-to-end frontend tests with the Tauri command bridge mocked: all three platforms. These cover the screen-level flow anywhere, including macOS, but they do not exercise the real backend.
+- The full command-to-confirm-to-execute flow against real Postgres on macOS is verified manually, which docs/25-exit-conditions-definition-of-done.md requires for phase 1 regardless.
+
+A dependency audit job runs `cargo audit` and `npm audit` per docs/16-security-and-cybersafety-checklist.md, item 6.

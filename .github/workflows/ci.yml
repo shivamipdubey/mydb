@@ -1,0 +1,125 @@
+# Cross-platform build and test matrix.
+#
+# MYDB is developed on macOS only, so this matrix is how Windows and Linux
+# breakage is caught per commit instead of accumulating until phase 3
+# (docs/03-phases-roadmap.md). All runners are standard GitHub-hosted.
+#
+# Actions are pinned to commit SHAs rather than tags: a tag is mutable, so a
+# compromised upstream tag could otherwise alter our build silently
+# (docs/16-security-and-cybersafety-checklist.md, item 6).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: build & test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Tauri needs the system WebView and its build dependencies on Linux.
+      # macOS and Windows ship theirs with the OS.
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev \
+            build-essential
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: '. -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # The Rust build embeds the built frontend at compile time, so the
+      # frontend must be built before anything Rust is compiled.
+      - name: Build frontend
+        run: npm run vite:build
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build Rust workspace
+        run: cargo build --workspace --locked
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+  # Integration tests need a real Postgres. GitHub-hosted macOS runners have no
+  # Docker daemon and Windows runners only run Windows containers, so service
+  # containers are Linux-only. Adapter integration coverage therefore runs here
+  # alone; docs/18-testing-strategy.md records this limitation.
+  integration:
+    name: integration (postgres, ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Placeholder
+        run: echo "Postgres service container and adapter integration tests are added in T3."
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # A reported vulnerability is blocking. Unmaintained and unsound
+      # advisories on transitive dependencies we do not choose directly are
+      # recorded, not blocking (docs/16, item 6).
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2025-0081 --ignore RUSTSEC-2025-0075 --ignore RUSTSEC-2025-0080 --ignore RUSTSEC-2025-0100 --ignore RUSTSEC-2025-0098 --ignore RUSTSEC-2024-0429
+
+      - name: Audit npm dependencies
+        run: npm ci && npm audit --audit-level=moderate
