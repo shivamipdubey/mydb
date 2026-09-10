@@ -1,0 +1,28 @@
+# Local Postgres instance used only for tests (docs/18-testing-strategy.md).
+#
+# The credentials below are throwaway and intentionally committed: this
+# container holds nothing but generated fixture data and is never reachable
+# from outside this machine. Real connection credentials are a different thing
+# entirely and live in the local config file, which is gitignored
+# (docs/06-credential-vault.md).
+#
+# The image is pinned by digest, not just tag, so a retagged upstream image
+# cannot silently change what tests run against.
+services:
+  postgres:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    container_name: mydb-test-postgres
+    environment:
+      POSTGRES_USER: mydb_test
+      POSTGRES_PASSWORD: mydb_test_password
+      POSTGRES_DB: mydb_test
+    ports:
+      # Non-default host port so this never collides with a real local Postgres.
+      - "55432:5432"
+    volumes:
+      - ./testing/seed.sql:/docker-entrypoint-initdb.d/01-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mydb_test -d mydb_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

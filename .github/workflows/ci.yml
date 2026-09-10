@@ -94,10 +94,51 @@ jobs:
   integration:
     name: integration (postgres, ubuntu)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same digest-pinned image as docker-compose.yml, so CI and local
+        # development test against byte-identical Postgres.
+        image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+        env:
+          POSTGRES_USER: mydb_test
+          POSTGRES_PASSWORD: mydb_test_password
+          POSTGRES_DB: mydb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mydb_test -d mydb_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      MYDB_TEST_DATABASE_URL: host=localhost port=5432 user=mydb_test password=mydb_test_password dbname=mydb_test
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: Placeholder
-        run: echo "Postgres service container and adapter integration tests are added in T3."
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: '. -> target'
+
+      # A service container runs the image's entrypoint but cannot mount our
+      # seed file, so the seed is applied here instead of via initdb.
+      - name: Seed the database
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+          PGPASSWORD=mydb_test_password psql -v ON_ERROR_STOP=1 -h localhost -p 5432 -U mydb_test -d mydb_test -f testing/seed.sql
+
+      # Integration tests are #[ignore]d so `cargo test` works without Docker.
+      # This job runs them explicitly, and fails if none actually ran, so a
+      # suite that quietly stops executing cannot look like a pass.
+      - name: Run integration tests
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked -- --ignored 2>&1 | tee integration.log
+          if ! grep -qE "test result: ok\. [1-9][0-9]* passed" integration.log; then
+            echo "::error::No integration tests actually ran"
+            exit 1
+          fi
 
   audit:
     name: dependency audit

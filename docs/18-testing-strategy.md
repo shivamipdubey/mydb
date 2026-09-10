@@ -40,3 +40,10 @@ Continuous integration builds and tests on Windows, macOS, and Linux on every co
 - The full command-to-confirm-to-execute flow against real Postgres on macOS is verified manually, which docs/25-exit-conditions-definition-of-done.md requires for phase 1 regardless.
 
 A dependency audit job runs `cargo audit` and `npm audit` per docs/16-security-and-cybersafety-checklist.md, item 6.
+
+## The Postgres test instance
+`docker-compose.yml` runs Postgres locally, pinned by image digest rather than tag so a retagged upstream image cannot silently change what tests run against. CI uses the same digest as a service container. Control it with `npm run db:up`, `db:reset`, and `db:down`.
+
+`testing/seed.sql` holds a small, exact fixture: seven users and four orders, with values chosen so a filter's expected result can be asserted literally. It is re-runnable, so any test that mutates data restores a known state rather than depending on execution order.
+
+Integration tests are marked `#[ignore]` so `cargo test` remains runnable without Docker, and are run with `npm run test:integration`. They are never skipped silently: an ignored test reports as ignored, CI runs them explicitly, and the CI job fails if no integration test actually executed, so a suite that quietly stops running cannot be mistaken for a passing one.

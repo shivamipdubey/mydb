@@ -49,6 +49,8 @@ Stack is Tauri v2 with a Rust backend and a TypeScript/React frontend (docs/02-a
 - Run: `npm run dev`
 - Test: `cargo test --workspace && npm test`
 - Lint: `cargo clippy --workspace --all-targets && npm run lint`
+- Test database: `npm run db:up`, `npm run db:reset`, `npm run db:down`
+- Integration tests (needs the test database): `npm run test:integration`
 - Package (macOS): `npm run build`
 
 Requires the Rust toolchain, Node, and Docker (Docker is used only for the Postgres test instance; the app itself never needs a network).
