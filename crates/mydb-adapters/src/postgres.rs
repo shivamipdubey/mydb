@@ -207,17 +207,19 @@ impl Adapter for PostgresAdapter {
 }
 
 impl PostgresAdapter {
-    /// Reads the column names of one table, in the table's own order.
+    /// Reads one table's columns, in the table's own order, with their types.
     ///
-    /// Needed twice over: the preview screen needs a header row, and the
-    /// SELECT below names each column explicitly rather than using `*`.
-    async fn column_names(
+    /// Three things need this and all three need the types, not just the
+    /// names: the preview screen's header row, the explicit projection below,
+    /// and, most importantly, typing each filter parameter to the column it
+    /// will be compared against.
+    async fn describe_table(
         &self,
         namespace: &str,
         table: &str,
-    ) -> Result<Vec<String>, AdapterError> {
+    ) -> Result<Vec<Column>, AdapterError> {
         const SQL: &str = "
-            SELECT column_name
+            SELECT column_name, data_type, is_nullable
               FROM information_schema.columns
              WHERE table_schema = $1
                AND table_name = $2
@@ -238,7 +240,14 @@ impl PostgresAdapter {
             )));
         }
 
-        Ok(rows.iter().map(|row| row.get("column_name")).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Column {
+                name: row.get("column_name"),
+                data_type: row.get("data_type"),
+                nullable: row.get::<_, String>("is_nullable") == "YES",
+            })
+            .collect())
     }
 
     /// Reads the records a filter matches, with an exact count.
@@ -249,7 +258,10 @@ impl PostgresAdapter {
     /// should not be a second implementation that could drift from the real
     /// read.
     async fn read_matching(&self, intent: &Intent) -> Result<RecordSet, AdapterError> {
-        let columns = self.column_names(&intent.namespace, &intent.table).await?;
+        let schema_columns = self
+            .describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let columns: Vec<String> = schema_columns.iter().map(|c| c.name.clone()).collect();
         let table = quote_table(&intent.namespace, &intent.table);
 
         // Each column is cast to text so any column type the user happens to
@@ -264,7 +276,7 @@ impl PostgresAdapter {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let clause = build_where(&intent.filter, 1);
+        let clause = build_where(&intent.filter, &schema_columns, 1);
         let params = as_driver_params(&clause.params);
 
         let client = self.client.lock().await;
@@ -317,11 +329,16 @@ impl PostgresAdapter {
     /// transaction where the engine supports it, so a mid-statement failure
     /// cannot leave a partial change behind.
     async fn execute_delete(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+        let schema_columns = self
+            .describe_table(&intent.namespace, &intent.table)
+            .await?;
         let table = quote_table(&intent.namespace, &intent.table);
 
-        // Built by the same function, from the same filter, as the preview's
-        // WHERE clause. The two cannot describe different sets of rows.
-        let clause = build_where(&intent.filter, 1);
+        // Built by the same function, from the same filter, against the same
+        // column types as the preview's WHERE clause. The two cannot describe
+        // different sets of rows, and cannot disagree about how a value is
+        // typed or how text is matched.
+        let clause = build_where(&intent.filter, &schema_columns, 1);
         let params = as_driver_params(&clause.params);
         let sql = format!("DELETE FROM {table}{}", clause.sql);
 

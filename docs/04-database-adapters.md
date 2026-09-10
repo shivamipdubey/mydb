@@ -8,6 +8,18 @@ Each supported engine gets its own adapter. An adapter must implement four opera
 - Preview for schema changes (DROP TABLE, ALTER TABLE): show the current schema and row count of the affected table. Phase 1 implements DROP TABLE and TRUNCATE only; ALTER TABLE is backlogged to phase 2 (docs/03-phases-roadmap.md), so the rule above is specified but not yet built for it.
 - Transactions: wrap the real write in a transaction where the engine supports it, so a mid-statement failure does not leave a partial row change.
 
+### Typing a filter's parameters
+Bind every filter parameter according to the target column's real type, read from the schema. Do not bind a value from its own apparent type and hope the engine resolves it.
+
+The reason is concrete. A Rust `i64` bound against an `integer` column fails outright, because `int8` is not `int4` and the driver will not guess. A date bound as text needs an explicit cast, because Postgres infers a parameter's type from its comparison. These look like separate bugs and are one bug: the query builder not using the column types it already has.
+
+The rule follows from that: the builder is given the table's columns, not just the filter, and each parameter is bound natively where an exact type exists, cast from text where it does not, and compared as text for anything exotic. Casting is applied to the parameter, never the column, so an index on the column can still be used.
+
+### Matching text
+Compare text columns case-insensitively for equality and inequality. Someone typing a command in plain language should not have to guess the capitalisation the database happens to store.
+
+Fold case in the comparison only. The stored value and the value the user typed are both left exactly as they are; a preview shows the row's real capitalisation even when it was found by typing something different. Ordering comparisons keep the database's own collation, since whether two names are the same name is a different question from how they sort.
+
 ### Connection details
 Set connection parameters on the driver's own configuration builder; never format them into a connection string. A password containing a space, quote, or equals sign would corrupt a hand-built string, and the resulting parse error can carry fragments of the credential into a message the user sees. This is the same reasoning as docs/16-security-and-cybersafety-checklist.md item 3, applied to connecting rather than querying.
 
