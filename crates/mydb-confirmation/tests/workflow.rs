@@ -90,6 +90,7 @@ fn intent(operation: Operation, filter: Filter) -> Intent {
         table: "users".to_string(),
         operation,
         filter,
+        assignments: Vec::new(),
     }
 }
 

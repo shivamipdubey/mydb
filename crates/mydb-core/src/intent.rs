@@ -29,6 +29,8 @@ use crate::Engine;
 pub enum Operation {
     Read,
     Delete,
+    Insert,
+    Update,
 }
 
 impl Operation {
@@ -42,16 +44,22 @@ impl Operation {
     pub fn is_write(self) -> bool {
         match self {
             Operation::Read => false,
-            Operation::Delete => true,
+            Operation::Delete | Operation::Insert | Operation::Update => true,
         }
     }
 
     /// Whether this operation destroys data, which docs/11 requires an extra
     /// confirmation step for on a production-flagged connection.
+    ///
+    /// An update counts. docs/11 names "delete, drop, truncate, or similar",
+    /// and an update overwrites values that were there before:
+    /// docs/07-audit-log-and-recovery-bin.md treats overwritten data as
+    /// something the recovery bin must hold, which is to say as data loss. An
+    /// insert creates a row and destroys nothing, so it does not count.
     pub fn is_destructive(self) -> bool {
         match self {
-            Operation::Read => false,
-            Operation::Delete => true,
+            Operation::Read | Operation::Insert => false,
+            Operation::Delete | Operation::Update => true,
         }
     }
 
@@ -59,6 +67,8 @@ impl Operation {
         match self {
             Operation::Read => "read",
             Operation::Delete => "delete",
+            Operation::Insert => "insert",
+            Operation::Update => "update",
         }
     }
 }
@@ -158,6 +168,28 @@ impl Condition {
     }
 }
 
+/// A value being written to a column, by an insert or an update.
+///
+/// Structured for the same reason a [`Condition`] is: the column name is
+/// resolved against the schema before it gets here, and the value is bound as
+/// a parameter rather than written into the statement
+/// (docs/16-security-and-cybersafety-checklist.md item 3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Value,
+}
+
+impl Assignment {
+    pub fn describe(&self) -> String {
+        format!(
+            "{} = {}",
+            self.column.replace('_', " "),
+            self.value.display()
+        )
+    }
+}
+
 /// Which records an operation applies to.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter {
@@ -205,6 +237,9 @@ pub struct Intent {
     pub table: String,
     pub operation: Operation,
     pub filter: Filter,
+    /// The values an insert or update writes. Empty for reads and deletes.
+    #[serde(default)]
+    pub assignments: Vec<Assignment>,
 }
 
 impl Intent {
@@ -247,7 +282,36 @@ impl Intent {
                     format!("Delete records in {table} where {}", self.filter.describe())
                 }
             }
+            Operation::Insert => {
+                format!(
+                    "Add one record to {table}, with {}",
+                    self.describe_assignments()
+                )
+            }
+            Operation::Update => {
+                if self.filter.matches_everything() {
+                    format!(
+                        "Update every record in {table}, setting {}",
+                        self.describe_assignments()
+                    )
+                } else {
+                    format!(
+                        "Update records in {table} where {}, setting {}",
+                        self.filter.describe(),
+                        self.describe_assignments()
+                    )
+                }
+            }
         }
+    }
+
+    /// The values being written, in plain language.
+    fn describe_assignments(&self) -> String {
+        self.assignments
+            .iter()
+            .map(Assignment::describe)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -262,15 +326,61 @@ mod tests {
             table: "users".to_string(),
             operation: Operation::Delete,
             filter,
+            assignments: Vec::new(),
         }
     }
 
     #[test]
-    fn a_delete_is_a_write_and_a_read_is_not() {
-        assert!(Operation::Delete.is_write());
-        assert!(Operation::Delete.is_destructive());
-        assert!(!Operation::Read.is_write());
-        assert!(!Operation::Read.is_destructive());
+    fn every_operation_is_classified_deliberately() {
+        assert!(Operation::Delete.is_write() && Operation::Delete.is_destructive());
+        assert!(Operation::Update.is_write() && Operation::Update.is_destructive());
+        // An insert writes but destroys nothing.
+        assert!(Operation::Insert.is_write() && !Operation::Insert.is_destructive());
+        assert!(!Operation::Read.is_write() && !Operation::Read.is_destructive());
+    }
+
+    #[test]
+    fn an_insert_describes_the_record_it_would_create() {
+        let intent = Intent {
+            engine: Engine::Postgres,
+            namespace: "public".to_string(),
+            table: "users".to_string(),
+            operation: Operation::Insert,
+            filter: Filter::everything(),
+            assignments: vec![
+                Assignment {
+                    column: "email".to_string(),
+                    value: Value::Text("ada@example.com".to_string()),
+                },
+                Assignment {
+                    column: "full_name".to_string(),
+                    value: Value::Text("Ada Lovelace".to_string()),
+                },
+            ],
+        };
+        assert_eq!(
+            intent.describe(),
+            "Add one record to users, with email = \"ada@example.com\", full name = \"Ada Lovelace\""
+        );
+    }
+
+    #[test]
+    fn an_unfiltered_update_says_every_record_out_loud() {
+        let intent = Intent {
+            engine: Engine::Postgres,
+            namespace: "public".to_string(),
+            table: "users".to_string(),
+            operation: Operation::Update,
+            filter: Filter::everything(),
+            assignments: vec![Assignment {
+                column: "active".to_string(),
+                value: Value::Boolean(false),
+            }],
+        };
+        assert_eq!(
+            intent.describe(),
+            "Update every record in users, setting active = false"
+        );
     }
 
     #[test]

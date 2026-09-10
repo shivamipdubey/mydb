@@ -38,6 +38,7 @@ const AFFECTED = {
 const NEEDS_CONFIRMATION = {
   kind: "needsConfirmation",
   description: "Delete records in users where active is false",
+  operation: "delete",
   affected: AFFECTED,
   destructive: true,
   affectsEverything: false,
@@ -103,7 +104,7 @@ describe("the confirmation loop", () => {
     expect(
       await screen.findByText("Delete records in users where active is false"),
     ).toBeInTheDocument();
-    expect(screen.getByText("2 records will be affected.")).toBeInTheDocument();
+    expect(screen.getByText("2 records will be deleted.")).toBeInTheDocument();
 
     // The actual records, not just a count.
     expect(screen.getByText("alan@example.com")).toBeInTheDocument();
@@ -189,6 +190,39 @@ describe("the confirmation loop", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent(/no table called/);
     expect(screen.queryByRole("button", { name: "Confirm" })).not.toBeInTheDocument();
+  });
+
+  it("an insert says the record will be created, not affected", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        kind: "needsConfirmation",
+        operation: "insert",
+        description: "Add one record to users, with email = \"z@example.com\"",
+        destructive: false,
+        affected: { ...AFFECTED, rows: [["8", "z@example.com"]], totalCount: 1 },
+      },
+    });
+    await submit("add a user with email is z@example.com");
+
+    expect(await screen.findByText("1 record will be created.")).toBeInTheDocument();
+    // An insert destroys nothing, so it must not be labelled destructive.
+    expect(screen.queryByText(/Destructive/)).not.toBeInTheDocument();
+  });
+
+  it("an update says the records will be updated", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        operation: "update",
+        description: "Update records in users where id is 3, setting active = false",
+      },
+    });
+    await submit("update users set active to false where id is 3");
+
+    expect(await screen.findByText("2 records will be updated.")).toBeInTheDocument();
+    // An update overwrites what was there, so it is destructive.
+    expect(screen.getByText(/Destructive/)).toBeInTheDocument();
   });
 
   it("a read shows its result with no confirmation step", async () => {

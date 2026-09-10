@@ -3,11 +3,14 @@
 //! Phase 1's only engine. Preview and execute arrive in T7; this module
 //! currently covers connect, describe schema, and health.
 
-use mydb_core::{Column, Intent, Operation, Schema, Table};
+use mydb_core::{Assignment, Column, Intent, Operation, Schema, Table, Value};
 use tokio_postgres::{Client, NoTls};
 
 use crate::records::{Record, RecordSet, SAMPLE_LIMIT};
-use crate::sql::{as_driver_params, build_where, quote_identifier, quote_table};
+use crate::sql::{
+    as_driver_params, build_insert, build_set, build_where, can_write_to, quote_identifier,
+    quote_table,
+};
 use crate::{Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview};
 
 /// Everything needed to reach one Postgres database.
@@ -186,6 +189,12 @@ impl Adapter for PostgresAdapter {
             // shows the result. Reaching here means the workflow routed a
             // read down the write path, which is a logic error worth failing
             // loudly rather than quietly previewing.
+            Operation::Update => self.preview_update(intent).await,
+            Operation::Insert => self.preview_insert(intent).await,
+            // A read needs no preview: docs/05 step 4 runs it directly and
+            // shows the result. Reaching here means the workflow routed a
+            // read down the write path, which is a logic error worth failing
+            // loudly rather than quietly previewing.
             Operation::Read => Err(AdapterError::Unsupported(
                 "a read does not need a preview; run it directly".to_string(),
             )),
@@ -199,6 +208,8 @@ impl Adapter for PostgresAdapter {
 
         match intent.operation {
             Operation::Delete => self.execute_delete(intent).await,
+            Operation::Update => self.execute_update(intent).await,
+            Operation::Insert => self.execute_insert(intent).await,
             Operation::Read => Err(AdapterError::Unsupported(
                 "a read is not an executable write".to_string(),
             )),
@@ -217,9 +228,9 @@ impl PostgresAdapter {
         &self,
         namespace: &str,
         table: &str,
-    ) -> Result<Vec<Column>, AdapterError> {
+    ) -> Result<Vec<ColumnShape>, AdapterError> {
         const SQL: &str = "
-            SELECT column_name, data_type, is_nullable
+            SELECT column_name, data_type, is_nullable, column_default
               FROM information_schema.columns
              WHERE table_schema = $1
                AND table_name = $2
@@ -242,10 +253,13 @@ impl PostgresAdapter {
 
         Ok(rows
             .iter()
-            .map(|row| Column {
-                name: row.get("column_name"),
-                data_type: row.get("data_type"),
-                nullable: row.get::<_, String>("is_nullable") == "YES",
+            .map(|row| ColumnShape {
+                column: Column {
+                    name: row.get("column_name"),
+                    data_type: row.get("data_type"),
+                    nullable: row.get::<_, String>("is_nullable") == "YES",
+                },
+                default: row.get("column_default"),
             })
             .collect())
     }
@@ -258,9 +272,11 @@ impl PostgresAdapter {
     /// should not be a second implementation that could drift from the real
     /// read.
     async fn read_matching(&self, intent: &Intent) -> Result<RecordSet, AdapterError> {
-        let schema_columns = self
-            .describe_table(&intent.namespace, &intent.table)
-            .await?;
+        let schema_columns = columns_of(
+            &self
+                .describe_table(&intent.namespace, &intent.table)
+                .await?,
+        );
         let columns: Vec<String> = schema_columns.iter().map(|c| c.name.clone()).collect();
         let table = quote_table(&intent.namespace, &intent.table);
 
@@ -329,9 +345,11 @@ impl PostgresAdapter {
     /// transaction where the engine supports it, so a mid-statement failure
     /// cannot leave a partial change behind.
     async fn execute_delete(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
-        let schema_columns = self
-            .describe_table(&intent.namespace, &intent.table)
-            .await?;
+        let schema_columns = columns_of(
+            &self
+                .describe_table(&intent.namespace, &intent.table)
+                .await?,
+        );
         let table = quote_table(&intent.namespace, &intent.table);
 
         // Built by the same function, from the same filter, against the same
@@ -342,10 +360,183 @@ impl PostgresAdapter {
         let params = as_driver_params(&clause.params);
         let sql = format!("DELETE FROM {table}{}", clause.sql);
 
+        self.in_transaction(&sql, &params).await
+    }
+}
+
+/// A column, plus the default the table gives it when a value is not supplied.
+struct ColumnShape {
+    column: Column,
+    default: Option<String>,
+}
+
+fn columns_of(shape: &[ColumnShape]) -> Vec<Column> {
+    shape.iter().map(|entry| entry.column.clone()).collect()
+}
+
+/// A value as the preview should display it. `None` renders as null.
+fn display_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Text(text) => Some(text.clone()),
+        Value::Integer(number) => Some(number.to_string()),
+        Value::Float(number) => Some(number.to_string()),
+        Value::Boolean(flag) => Some(flag.to_string()),
+        Value::Date(date) => Some(date.clone()),
+        Value::Null => None,
+    }
+}
+
+impl PostgresAdapter {
+    /// Refuses a write MYDB cannot type correctly.
+    ///
+    /// An exotic column type can be read and compared as text, but writing
+    /// one needs a cast that cannot be built without knowing the underlying
+    /// type. Saying so plainly beats writing something subtly wrong.
+    fn check_writable(assignments: &[Assignment], columns: &[Column]) -> Result<(), AdapterError> {
+        for assignment in assignments {
+            match columns.iter().find(|c| c.name == assignment.column) {
+                None => {
+                    return Err(AdapterError::query(format!(
+                        "no column called {}",
+                        assignment.column
+                    )))
+                }
+                Some(column) if !can_write_to(&column.data_type) => {
+                    return Err(AdapterError::Unsupported(format!(
+                        "MYDB cannot write to {}, which is of type {}, yet",
+                        column.name, column.data_type
+                    )))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The INSERT preview: the exact record that will be created.
+    ///
+    /// docs/04-database-adapters.md is explicit that this needs no read
+    /// against existing data, and it does none. It reads the table's shape
+    /// so it can show every column, including the ones the command did not
+    /// name: those are where a default or a null will land, and a person
+    /// checking whether the new record is right needs to see them.
+    async fn preview_insert(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        let shape = self
+            .describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let schema_columns = columns_of(&shape);
+        Self::check_writable(&intent.assignments, &schema_columns)?;
+
+        let cells = shape
+            .iter()
+            .map(|entry| {
+                match intent
+                    .assignments
+                    .iter()
+                    .find(|assignment| assignment.column == entry.column.name)
+                {
+                    Some(assignment) => display_value(&assignment.value),
+                    // Showing the default expression rather than a blank is
+                    // the honest answer: the row will not be null here.
+                    None => entry.default.clone(),
+                }
+            })
+            .collect();
+
+        let statement = build_insert(
+            &quote_table(&intent.namespace, &intent.table),
+            &intent.assignments,
+            &schema_columns,
+        );
+
+        Ok(Preview::new(
+            intent.clone(),
+            RecordSet::new(
+                schema_columns.iter().map(|c| c.name.clone()).collect(),
+                vec![Record { cells }],
+                1,
+                statement.sql,
+            ),
+        ))
+    }
+
+    /// The UPDATE preview: the equivalent SELECT with the same WHERE clause,
+    /// showing the records that will be changed
+    /// (docs/04-database-adapters.md).
+    async fn preview_update(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        let schema_columns = columns_of(
+            &self
+                .describe_table(&intent.namespace, &intent.table)
+                .await?,
+        );
+        // Checked before the preview, not after: a preview the user could
+        // confirm and then have fail would be worse than an early refusal.
+        Self::check_writable(&intent.assignments, &schema_columns)?;
+
+        let affected = self.read_matching(intent).await?;
+        Ok(Preview::new(intent.clone(), affected))
+    }
+
+    /// Runs a confirmed INSERT inside a transaction.
+    async fn execute_insert(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+        let schema_columns = columns_of(
+            &self
+                .describe_table(&intent.namespace, &intent.table)
+                .await?,
+        );
+        Self::check_writable(&intent.assignments, &schema_columns)?;
+
+        // Built from the same assignments, against the same column types, as
+        // the statement shown in the preview.
+        let statement = build_insert(
+            &quote_table(&intent.namespace, &intent.table),
+            &intent.assignments,
+            &schema_columns,
+        );
+        let params = as_driver_params(&statement.params);
+
+        self.in_transaction(&statement.sql, &params).await
+    }
+
+    /// Runs a confirmed UPDATE inside a transaction.
+    async fn execute_update(&self, intent: &Intent) -> Result<ExecutionOutcome, AdapterError> {
+        let schema_columns = columns_of(
+            &self
+                .describe_table(&intent.namespace, &intent.table)
+                .await?,
+        );
+        Self::check_writable(&intent.assignments, &schema_columns)?;
+
+        let table = quote_table(&intent.namespace, &intent.table);
+        let set = build_set(&intent.assignments, &schema_columns, 1);
+        // The WHERE clause continues the placeholder numbering, and is built
+        // by the same function, from the same filter, against the same column
+        // types as the preview's. They cannot select different records.
+        let clause = build_where(&intent.filter, &schema_columns, set.next_placeholder);
+
+        let sql = format!("UPDATE {table}{}{}", set.sql, clause.sql);
+        let mut params = set.params;
+        params.extend(clause.params);
+        let borrowed = as_driver_params(&params);
+
+        self.in_transaction(&sql, &borrowed).await
+    }
+
+    /// Runs one statement in a transaction.
+    ///
+    /// docs/04-database-adapters.md requires the real write to be wrapped in
+    /// a transaction where the engine supports it, so a mid-statement failure
+    /// cannot leave a partial change behind. Shared by every write so no
+    /// operation can be added later that quietly skips it.
+    async fn in_transaction(
+        &self,
+        sql: &str,
+        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<ExecutionOutcome, AdapterError> {
         let mut client = self.client.lock().await;
         let transaction = client.transaction().await.map_err(describe_query_failure)?;
 
-        let rows_affected = match transaction.execute(&sql, &params).await {
+        let rows_affected = match transaction.execute(sql, params).await {
             Ok(count) => count,
             Err(error) => {
                 // Rolled back explicitly rather than by drop, so the failure
@@ -356,7 +547,6 @@ impl PostgresAdapter {
         };
 
         transaction.commit().await.map_err(describe_query_failure)?;
-
         Ok(ExecutionOutcome { rows_affected })
     }
 }

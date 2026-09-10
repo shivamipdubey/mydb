@@ -284,6 +284,7 @@ async fn run_command(state: &AppState, text: String) -> UiResult<CommandOutcome>
         mydb_confirmation::Step::AwaitingConfirmation(pending) => {
             let outcome = CommandOutcome::NeedsConfirmation {
                 description: pending.description(),
+                operation: pending.intent().operation.verb().to_string(),
                 affected: view(pending.preview().affected()),
                 destructive: pending.intent().is_destructive(),
                 affects_everything: pending.intent().filter.matches_everything(),

@@ -13,7 +13,7 @@
 //!   bug after T9 both happened; typing each parameter from the schema fixes
 //!   the whole class rather than one type at a time.
 
-use mydb_core::{Column, Comparison, Filter, Value};
+use mydb_core::{Assignment, Column, Comparison, Filter, Value};
 use tokio_postgres::types::ToSql;
 
 /// An owned parameter value, ready to bind.
@@ -149,6 +149,152 @@ fn bind_native(data_type: &str, value: &Value) -> Option<SqlParam> {
     }
 }
 
+/// The parameter side of a comparison or assignment, and the value to bind.
+///
+/// Shared by filters, inserts, and updates so all three type a value the same
+/// way. They must agree: a preview that matched a row one way and an update
+/// that wrote it another would be two different statements wearing the same
+/// description.
+struct BoundValue {
+    /// The SQL to place where the value goes, such as `$1` or `($1::text)::date`.
+    expression: String,
+    param: SqlParam,
+}
+
+/// Types a single value against the column it is destined for.
+///
+/// Note this deliberately does not fold case. Case folding belongs to a
+/// comparison, and only to a comparison: applying it here would lowercase the
+/// data an insert or update actually writes.
+fn bind_value(data_type: &str, value: &Value, placeholder: usize) -> BoundValue {
+    match binding_for(data_type) {
+        Binding::Native => match bind_native(data_type, value) {
+            Some(param) => BoundValue {
+                expression: format!("${placeholder}"),
+                param,
+            },
+            // The value does not fit the column. Send it as text and let the
+            // database explain why, which is a far clearer error than a
+            // driver-level serialisation failure.
+            None => BoundValue {
+                expression: format!("(${placeholder}::text)::{data_type}"),
+                param: SqlParam::Text(as_text(value)),
+            },
+        },
+        Binding::Text => BoundValue {
+            expression: format!("${placeholder}"),
+            param: SqlParam::Text(as_text(value)),
+        },
+        Binding::CastTo(sql_type) => BoundValue {
+            expression: format!("(${placeholder}::text)::{sql_type}"),
+            param: SqlParam::Text(as_text(value)),
+        },
+        Binding::CompareAsText => BoundValue {
+            expression: format!("${placeholder}"),
+            param: SqlParam::Text(as_text(value)),
+        },
+    }
+}
+
+/// Looks up a column's type, or an empty string when the column is unknown.
+///
+/// An unknown column produces a statement the database will reject by name,
+/// which is more useful than failing here with less context.
+fn type_of<'a>(columns: &'a [Column], name: &str) -> &'a str {
+    columns
+        .iter()
+        .find(|column| column.name == name)
+        .map(|column| column.data_type.as_str())
+        .unwrap_or("")
+}
+
+/// Whether writing to this column type is supported yet.
+///
+/// An exotic type can be read and compared as text, but writing one needs a
+/// cast MYDB cannot construct without knowing the underlying type name.
+/// Refusing is better than writing something subtly wrong.
+pub fn can_write_to(data_type: &str) -> bool {
+    !matches!(binding_for(data_type), Binding::CompareAsText)
+}
+
+/// A rendered INSERT statement and its parameters.
+pub struct InsertStatement {
+    pub sql: String,
+    pub params: Vec<SqlParam>,
+}
+
+/// Builds `INSERT INTO table (cols) VALUES (...)`.
+pub fn build_insert(
+    table: &str,
+    assignments: &[Assignment],
+    columns: &[Column],
+) -> InsertStatement {
+    let mut names = Vec::with_capacity(assignments.len());
+    let mut values = Vec::with_capacity(assignments.len());
+    let mut params = Vec::with_capacity(assignments.len());
+
+    for (index, assignment) in assignments.iter().enumerate() {
+        let bound = bind_value(
+            type_of(columns, &assignment.column),
+            &assignment.value,
+            index + 1,
+        );
+        names.push(quote_identifier(&assignment.column));
+        values.push(bound.expression);
+        params.push(bound.param);
+    }
+
+    InsertStatement {
+        sql: format!(
+            "INSERT INTO {table} ({}) VALUES ({})",
+            names.join(", "),
+            values.join(", ")
+        ),
+        params,
+    }
+}
+
+/// A rendered SET clause and its parameters.
+pub struct SetClause {
+    /// Includes the leading " SET ".
+    pub sql: String,
+    pub params: Vec<SqlParam>,
+    /// The next free placeholder number, for the WHERE clause that follows.
+    pub next_placeholder: usize,
+}
+
+/// Builds `SET col = value, ...` for an update.
+pub fn build_set(
+    assignments: &[Assignment],
+    columns: &[Column],
+    first_placeholder: usize,
+) -> SetClause {
+    let mut fragments = Vec::with_capacity(assignments.len());
+    let mut params = Vec::with_capacity(assignments.len());
+    let mut placeholder = first_placeholder;
+
+    for assignment in assignments {
+        let bound = bind_value(
+            type_of(columns, &assignment.column),
+            &assignment.value,
+            placeholder,
+        );
+        fragments.push(format!(
+            "{} = {}",
+            quote_identifier(&assignment.column),
+            bound.expression
+        ));
+        params.push(bound.param);
+        placeholder += 1;
+    }
+
+    SetClause {
+        sql: format!(" SET {}", fragments.join(", ")),
+        params,
+        next_placeholder: placeholder,
+    }
+}
+
 /// A rendered WHERE clause and the parameters it expects.
 pub struct WhereClause {
     /// Includes the leading " WHERE ", or is empty when the filter matches
@@ -193,68 +339,35 @@ pub fn build_where(filter: &Filter, columns: &[Column], first_placeholder: usize
         }
 
         let operator = condition.comparison.operator();
-        let data_type = columns
-            .iter()
-            .find(|column| column.name == condition.column)
-            .map(|column| column.data_type.as_str())
-            // An unknown column cannot be typed. Comparing as text keeps the
-            // statement valid so the database reports the missing column,
-            // rather than this function failing in a less useful way.
-            .unwrap_or("");
+        let data_type = type_of(columns, &condition.column);
+        let bound = bind_value(data_type, &condition.value, placeholder);
+        let is_texty = matches!(
+            binding_for(data_type),
+            Binding::Text | Binding::CompareAsText
+        );
+        let comparable = match binding_for(data_type) {
+            // An exotic type has no cast MYDB can rely on, so both sides are
+            // compared as text. Always correct, at the cost of an index.
+            Binding::CompareAsText => format!("{quoted}::text"),
+            _ => quoted.clone(),
+        };
 
-        match binding_for(data_type) {
-            Binding::Native => match bind_native(data_type, &condition.value) {
-                Some(param) => {
-                    params.push(param);
-                    fragments.push(format!("{quoted} {operator} ${placeholder}"));
-                }
-                None => {
-                    // The value does not fit the column. Send it as text and
-                    // let the database explain why, which is a far clearer
-                    // error than a driver-level serialisation failure.
-                    params.push(SqlParam::Text(as_text(&condition.value)));
-                    fragments.push(format!(
-                        "{quoted} {operator} (${placeholder}::text)::{data_type}"
-                    ));
-                }
-            },
-
-            Binding::Text => {
-                params.push(SqlParam::Text(as_text(&condition.value)));
-                match condition.comparison {
-                    // Case-insensitive, because nobody typing a command in
-                    // plain language should have to guess the capitalisation
-                    // a database happens to store. Only the comparison folds
-                    // case: the stored value and the typed value are both
-                    // left exactly as they are.
-                    Comparison::Equals | Comparison::NotEquals => {
-                        fragments.push(format!("lower({quoted}) {operator} lower(${placeholder})"))
-                    }
-                    // Ordering comparisons keep the database's own collation.
-                    // Folding case there would change which rows sort where,
-                    // which is a different question from whether two names
-                    // are the same name.
-                    _ => fragments.push(format!("{quoted} {operator} ${placeholder}")),
-                }
-            }
-
-            Binding::CastTo(sql_type) => {
-                params.push(SqlParam::Text(as_text(&condition.value)));
-                fragments.push(format!(
-                    "{quoted} {operator} (${placeholder}::text)::{sql_type}"
-                ));
-            }
-
-            Binding::CompareAsText => {
-                params.push(SqlParam::Text(as_text(&condition.value)));
-                match condition.comparison {
-                    Comparison::Equals | Comparison::NotEquals => fragments.push(format!(
-                        "lower({quoted}::text) {operator} lower(${placeholder})"
-                    )),
-                    _ => fragments.push(format!("{quoted}::text {operator} ${placeholder}")),
-                }
-            }
+        match (is_texty, condition.comparison) {
+            // Case-insensitive, because nobody typing a command in plain
+            // language should have to guess the capitalisation a database
+            // happens to store. Only the comparison folds case: the stored
+            // value and the typed value are both left exactly as they are.
+            (true, Comparison::Equals | Comparison::NotEquals) => fragments.push(format!(
+                "lower({comparable}) {operator} lower({})",
+                bound.expression
+            )),
+            // Ordering comparisons keep the database's own collation. Folding
+            // case there would change which rows sort where, which is a
+            // different question from whether two names are the same name.
+            _ => fragments.push(format!("{comparable} {operator} {}", bound.expression)),
         }
+        params.push(bound.param);
+
         placeholder += 1;
     }
 

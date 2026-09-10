@@ -4,7 +4,7 @@ Each supported engine gets its own adapter. An adapter must implement four opera
 
 ## Postgres and MySQL (and other SQL engines)
 - Preview for UPDATE or DELETE: run the equivalent SELECT with the same WHERE clause, return the matching rows.
-- Preview for INSERT: show the exact row that will be created, no read needed against existing data.
+- Preview for INSERT: show the exact row that will be created, no read needed against existing data. Show every column of the table, not only the ones named: an unnamed column is where a default or a null will land, and someone checking whether the new record is right needs to see that. Reading the table's shape is not reading its data.
 - Preview for schema changes (DROP TABLE, ALTER TABLE): show the current schema and row count of the affected table. Phase 1 implements DROP TABLE and TRUNCATE only; ALTER TABLE is backlogged to phase 2 (docs/03-phases-roadmap.md), so the rule above is specified but not yet built for it.
 - Transactions: wrap the real write in a transaction where the engine supports it, so a mid-statement failure does not leave a partial row change.
 
@@ -33,8 +33,15 @@ The preview's WHERE clause and the write's WHERE clause are produced by the same
 ### A preview cannot predict a constraint
 A preview reports which records match. It does not know whether the engine will accept the write: a foreign key, a check constraint, or a trigger can still refuse it. When that happens the transaction rolls back, nothing changes, and the user sees a typed error. This is a known and accepted limit, not a gap in the preview.
 
+### Writing values
+An insert or update binds its values through the same typing rules as a filter, against the same column types, so a preview and the write it describes cannot disagree about how a value is handled.
+
+One difference matters: case folding belongs to comparisons only. A filter matches text case-insensitively, but an insert or update writes exactly the value the user typed. Folding case on the way in would quietly rewrite the user's data.
+
+A column whose type MYDB cannot type a parameter for can still be read and compared as text, but not written. Writing it is refused by name, before any preview, since a preview the user could confirm and then have fail is worse than an early refusal.
+
 ### What is implemented for Postgres
-Phase 1: connect, describe schema, and a read-only health check. Preview and execute for DELETE arrive in T7, INSERT and UPDATE in T10, DROP TABLE and TRUNCATE in T11. The adapter interface deliberately does not expose an execute function until the preview guard that governs it exists, so there is no window in which an adapter can execute without one.
+Phase 1: connect, describe schema, a read-only health check, and preview plus execute for DELETE, INSERT, and UPDATE. DROP TABLE and TRUNCATE arrive in T11. The adapter interface deliberately does not expose an execute function until the preview guard that governs it exists, so there is no window in which an adapter can execute without one.
 
 The health check reads the server version. docs/13-dashboard-and-health-monitoring.md requires it to be lightweight and strictly read-only, never something that could be mistaken for a data-changing operation.
 

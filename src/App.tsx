@@ -115,7 +115,7 @@ export function App() {
             busy={busy}
             placeholder={
               active
-                ? "delete every user who signed up before 2024"
+                ? "update users set active to false where id is 3"
                 : "Connect to a database first"
             }
             onSubmit={(text) =>

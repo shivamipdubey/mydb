@@ -35,6 +35,15 @@ pub enum ParseError {
     #[error("could not understand the condition \"{clause}\"")]
     UnparseableCondition { clause: String },
 
+    #[error("could not understand \"{clause}\" as a column and a value to give it")]
+    UnparseableAssignment { clause: String },
+
+    #[error("this {operation} names no values. For example: {hint}")]
+    MissingValues { operation: String, hint: String },
+
+    #[error("an insert creates a new record, so it cannot have a condition selecting records")]
+    FilterOnInsert,
+
     #[error("\"{value}\" is not a valid {expected} for the column {column}")]
     UnparseableValue {
         value: String,

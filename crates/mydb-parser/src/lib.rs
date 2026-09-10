@@ -19,7 +19,9 @@ mod tokens;
 
 pub use error::ParseError;
 
-use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Table, Value};
+use mydb_core::{
+    Assignment, Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Table, Value,
+};
 
 use tokens::{normalise_phrase, strip_noise_words};
 
@@ -31,22 +33,38 @@ const READ_VERBS: [&str; 8] = [
 /// Words that begin a delete.
 const DELETE_VERBS: [&str; 3] = ["delete", "remove", "erase"];
 
+/// Words that begin an insert.
+const INSERT_VERBS: [&str; 3] = ["insert", "add", "create"];
+
+/// Words that begin an update.
+const UPDATE_VERBS: [&str; 3] = ["update", "set", "change"];
+
+/// Introduces an insert's values: "add a user with email is ada@example.com".
+const INSERT_INTRODUCER: &str = " with ";
+
+/// Introduces an update's values: "update users set active to false".
+const UPDATE_INTRODUCER: &str = " set ";
+
+/// Separates an update's target from its values in the "set X for Y" form.
+const UPDATE_TARGET_INTRODUCERS: [&str; 3] = [" for ", " on ", " in "];
+
 /// Operations phase 1 does not parse yet. Recognised explicitly so the user is
 /// told the operation is not supported, rather than having their command fail
 /// as unintelligible or, worse, be matched to something else.
-const NOT_YET_SUPPORTED: [(&str, &str); 6] = [
-    ("insert", "INSERT"),
-    ("add", "INSERT"),
-    ("create", "INSERT"),
-    ("update", "UPDATE"),
-    ("set", "UPDATE"),
-    ("truncate", "TRUNCATE"),
-];
+const NOT_YET_SUPPORTED: [(&str, &str); 1] = [("truncate", "TRUNCATE")];
 
 /// Phrases that introduce a filter.
 const FILTER_INTRODUCERS: [&str; 6] = [
     " where ", " whose ", " who ", " that ", " with ", " having ",
 ];
+
+/// Filter introducers for an insert.
+///
+/// "with" is missing on purpose: an insert uses it to introduce the values it
+/// writes, so treating it as a filter would split "add a user with email is
+/// ada@example.com" in exactly the wrong place. This is why the operation has
+/// to be known before the command is split, not after.
+const INSERT_FILTER_INTRODUCERS: [&str; 5] = [" where ", " whose ", " who ", " that ", " having "];
 
 /// Parses a command against a known schema.
 ///
@@ -63,22 +81,58 @@ pub fn parse(input: &str, schema: &Schema, engine: Engine) -> Result<Intent, Par
     // to_ascii_lowercase, not to_lowercase: it maps only ASCII letters and so
     // is guaranteed to preserve byte length. That lets every offset found in
     // the lowercased text index the original safely, which is what keeps a
-    // user's value from being case-folded on its way into the filter.
+    // user's value from being case-folded on its way into the intent.
     let lowered = trimmed.to_ascii_lowercase();
 
-    let (subject_end, filter_start) = split_filter(&lowered);
+    // The operation comes from the leading verb, before anything is split,
+    // because which words introduce a filter depends on which operation this
+    // is. It is read from the verb alone and never from the filter, so a
+    // value like "my table" cannot change what the command is understood
+    // to be.
+    let operation = operation_from_verb(&lowered)?;
+
+    let introducers: &[&str] = match operation {
+        Operation::Insert => &INSERT_FILTER_INTRODUCERS,
+        _ => &FILTER_INTRODUCERS,
+    };
+    let (subject_end, filter_start) = split_filter(&lowered, introducers);
     let subject = &lowered[..subject_end];
 
-    // The operation is detected from the subject alone, never the filter. A
-    // value like "my table" or an injection attempt containing DROP TABLE
-    // must not change what operation the command is understood to be.
-    let operation = detect_operation(subject)?;
-    let table = resolve_table(subject, schema)?;
+    // "delete table x" is a schema operation, not a row delete. It arrives in
+    // T11 with its own preview (current schema and row count, not matching
+    // rows), so reading it as a row delete would show the wrong preview
+    // entirely. Checked against the subject, so a value containing the word
+    // cannot trigger it.
+    if operation == Operation::Delete && subject.split_whitespace().any(|word| word == "table") {
+        return Err(ParseError::NotYetSupported {
+            operation: "DROP TABLE".to_string(),
+        });
+    }
+
+    // Where the target table is named, and where the written values are,
+    // differ by operation. Splitting here keeps each shape's rules in one
+    // place instead of spreading special cases through the resolvers.
+    let (target_text, assignment_range) = match operation {
+        Operation::Read | Operation::Delete => (subject, None),
+        Operation::Insert => split_insert(subject)?,
+        Operation::Update => split_update(subject)?,
+    };
+
+    let table = resolve_table(target_text, schema)?;
+
+    let assignments = match assignment_range {
+        Some(range) => parse_assignments(&lowered[range.clone()], &trimmed[range], table)?,
+        None => Vec::new(),
+    };
 
     let filter = match filter_start {
         Some(start) => parse_filter(&lowered[start..], &trimmed[start..], table)?,
         None => Filter::everything(),
     };
+
+    if operation == Operation::Insert && !filter.matches_everything() {
+        return Err(ParseError::FilterOnInsert);
+    }
 
     Ok(Intent {
         engine,
@@ -86,33 +140,160 @@ pub fn parse(input: &str, schema: &Schema, engine: Engine) -> Result<Intent, Par
         table: table.name.clone(),
         operation,
         filter,
+        assignments,
+    })
+}
+
+/// Splits "add a user with email is ada@example.com" into its target and its
+/// values.
+fn split_insert(subject: &str) -> Result<(&str, Option<std::ops::Range<usize>>), ParseError> {
+    match subject.find(INSERT_INTRODUCER) {
+        Some(at) => Ok((
+            &subject[..at],
+            Some(at + INSERT_INTRODUCER.len()..subject.len()),
+        )),
+        // An insert with no values would create an empty row, which is almost
+        // never what someone meant to type.
+        None => Err(ParseError::MissingValues {
+            operation: "insert".to_string(),
+            hint: "add a user with email is ada@example.com".to_string(),
+        }),
+    }
+}
+
+/// Splits either "update users set active to false" or "set active to false
+/// for users" into target and values.
+fn split_update(subject: &str) -> Result<(&str, Option<std::ops::Range<usize>>), ParseError> {
+    if let Some(at) = subject.find(UPDATE_INTRODUCER) {
+        let values = at + UPDATE_INTRODUCER.len()..subject.len();
+        return Ok((&subject[..at], Some(values)));
+    }
+
+    // The "set X for Y" form: the command opens with the verb, so the values
+    // run from after it to whichever target word introduces the table.
+    let first_word_end = subject.find(char::is_whitespace).unwrap_or(subject.len());
+    for introducer in UPDATE_TARGET_INTRODUCERS {
+        if let Some(at) = subject.find(introducer) {
+            if at > first_word_end {
+                return Ok((&subject[at + introducer.len()..], Some(first_word_end..at)));
+            }
+        }
+    }
+
+    Err(ParseError::MissingValues {
+        operation: "update".to_string(),
+        hint: "update users set active to false where id is 3".to_string(),
+    })
+}
+
+/// Phrases that assign a value to a column.
+///
+/// Longest first, so "is not" cannot be read as "is". Assignment has no
+/// negative form, so "is not" is absent deliberately: it would mean nothing
+/// here and should fail rather than be silently read as equality.
+const ASSIGNMENT_OPERATORS: [&str; 4] = [" to ", " is ", " = ", " as "];
+
+/// Parses "active to false and email to a@b.com" into typed assignments.
+fn parse_assignments(
+    lowered: &str,
+    original: &str,
+    table: &Table,
+) -> Result<Vec<Assignment>, ParseError> {
+    let mut assignments = Vec::new();
+
+    for (start, end) in split_clauses(lowered) {
+        let clause_lower = &lowered[start..end];
+        let clause_original = &original[start..end];
+        if clause_lower.trim().is_empty() {
+            continue;
+        }
+        assignments.push(parse_assignment(clause_lower, clause_original, table)?);
+    }
+
+    if assignments.is_empty() {
+        return Err(ParseError::MissingValues {
+            operation: "write".to_string(),
+            hint: "name at least one column and the value to give it".to_string(),
+        });
+    }
+
+    Ok(assignments)
+}
+
+/// Splits a list of clauses on "and" or a comma, returning byte ranges so the
+/// caller can index the lowercased text and the original identically.
+fn split_clauses(lowered: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut cursor = 0;
+
+    while cursor < lowered.len() {
+        let next_and = lowered[cursor..].find(" and ").map(|at| (cursor + at, 5));
+        let next_comma = lowered[cursor..].find(',').map(|at| (cursor + at, 1));
+
+        let next = match (next_and, next_comma) {
+            (Some(a), Some(c)) => Some(if a.0 <= c.0 { a } else { c }),
+            (Some(a), None) => Some(a),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+
+        match next {
+            Some((at, width)) => {
+                ranges.push((start, at));
+                start = at + width;
+                cursor = start;
+            }
+            None => break,
+        }
+    }
+    ranges.push((start, lowered.len()));
+    ranges
+}
+
+fn parse_assignment(
+    lowered: &str,
+    original: &str,
+    table: &Table,
+) -> Result<Assignment, ParseError> {
+    for phrase in ASSIGNMENT_OPERATORS {
+        if let Some(position) = lowered.find(phrase) {
+            let value_at = position + phrase.len();
+            let column = resolve_column(lowered[..position].trim(), table)?;
+            let value = parse_value(
+                original[value_at..].trim(),
+                lowered[value_at..].trim(),
+                &column.data_type,
+                &column.name,
+            )?;
+            return Ok(Assignment {
+                column: column.name.clone(),
+                value,
+            });
+        }
+    }
+
+    Err(ParseError::UnparseableAssignment {
+        clause: original.trim().to_string(),
     })
 }
 
 /// Works out what the command asks for from its leading verb.
-fn detect_operation(subject: &str) -> Result<Operation, ParseError> {
-    let first = subject.split_whitespace().next().unwrap_or_default();
+fn operation_from_verb(lowered: &str) -> Result<Operation, ParseError> {
+    let first = lowered.split_whitespace().next().unwrap_or_default();
 
     if DELETE_VERBS.contains(&first) {
-        // "delete table x" and "drop" are schema operations, not row deletes.
-        // They arrive in T11 with their own preview (current schema and row
-        // count, not matching rows), so treating them as a row delete here
-        // would show the user the wrong preview entirely.
-        //
-        // This looks at the subject only. Scanning the whole command would let
-        // a filter value containing the word "table" change the operation.
-        if subject.split_whitespace().any(|word| word == "table") {
-            return Err(ParseError::NotYetSupported {
-                operation: "DROP TABLE".to_string(),
-            });
-        }
         return Ok(Operation::Delete);
     }
-
-    if READ_VERBS.contains(&first) || subject.starts_with("how many") {
+    if INSERT_VERBS.contains(&first) {
+        return Ok(Operation::Insert);
+    }
+    if UPDATE_VERBS.contains(&first) {
+        return Ok(Operation::Update);
+    }
+    if READ_VERBS.contains(&first) || lowered.starts_with("how many") {
         return Ok(Operation::Read);
     }
-
     if first == "drop" {
         return Err(ParseError::NotYetSupported {
             operation: "DROP TABLE".to_string(),
@@ -128,7 +309,7 @@ fn detect_operation(subject: &str) -> Result<Operation, ParseError> {
     }
 
     Err(ParseError::UnknownOperation {
-        input: subject.trim().to_string(),
+        input: lowered.trim().to_string(),
     })
 }
 
@@ -136,10 +317,10 @@ fn detect_operation(subject: &str) -> Result<Operation, ParseError> {
 ///
 /// Returns byte offsets rather than slices so the caller can index both the
 /// lowercased text and the original with the same positions.
-fn split_filter(lowered: &str) -> (usize, Option<usize>) {
+fn split_filter(lowered: &str, introducers: &[&str]) -> (usize, Option<usize>) {
     // The earliest introducer wins, so "delete users where x" splits at
     // "where" even though later words might also introduce a clause.
-    let earliest = FILTER_INTRODUCERS
+    let earliest = introducers
         .iter()
         .filter_map(|introducer| lowered.find(introducer).map(|at| (at, introducer.len())))
         .min_by_key(|(at, _)| *at);

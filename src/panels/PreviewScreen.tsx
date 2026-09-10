@@ -31,6 +31,16 @@ export function PreviewScreen({
   const { affected } = outcome;
   const count = affected.totalCount;
 
+  // A record being created does not yet exist, so "affected" reads wrongly.
+  // Naming the operation is also a second chance for the user to notice a
+  // misparse: an insert described as an update is worth catching here.
+  const verb =
+    outcome.operation === "insert"
+      ? "will be created"
+      : outcome.operation === "update"
+        ? "will be updated"
+        : "will be deleted";
+
   return (
     <section className="panel preview-panel" aria-label="Preview">
       <header className="panel-header">
@@ -53,10 +63,10 @@ export function PreviewScreen({
       <p className={count === 0 ? "affected affected-none" : "affected"}>
         {count === 0
           ? "This matches no records. Nothing would change."
-          : `${count} ${count === 1 ? "record" : "records"} will be affected.`}
+          : `${count} ${count === 1 ? "record" : "records"} ${verb}.`}
       </p>
 
-      {outcome.affectsEverything && count > 0 && (
+      {outcome.affectsEverything && count > 0 && outcome.operation !== "insert" && (
         <p className="warning">
           <span aria-hidden="true">⚠</span> This has no filter. It affects every
           record in the table.

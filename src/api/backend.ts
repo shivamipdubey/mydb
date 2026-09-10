@@ -54,6 +54,8 @@ export type CommandOutcome =
   | {
       kind: "needsConfirmation";
       description: string;
+      /** "delete", "insert", or "update". */
+      operation: string;
       affected: RecordsView;
       destructive: boolean;
       affectsEverything: boolean;

@@ -21,6 +21,7 @@ fn delete_intent(filter: Filter) -> Intent {
         table: "users".to_string(),
         operation: Operation::Delete,
         filter,
+        assignments: Vec::new(),
     }
 }
 

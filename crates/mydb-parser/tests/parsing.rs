@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use mydb_core::{Column, Comparison, Engine, Schema, Table, Value};
+use mydb_core::{Column, Comparison, Engine, Operation, Schema, Table, Value};
 use mydb_parser::{parse, ParseError};
 
 fn column(name: &str, data_type: &str) -> Column {
@@ -224,8 +224,6 @@ fn operations_not_yet_built_are_named_rather_than_misread() {
     // These must not be silently reinterpreted as some other operation. Each
     // arrives in a later task with its own preview behaviour.
     for (input, expected) in [
-        ("update users set active to false", "UPDATE"),
-        ("insert a user called ada", "INSERT"),
         ("truncate users", "TRUNCATE"),
         ("drop table users", "DROP TABLE"),
         ("delete table users", "DROP TABLE"),
@@ -301,5 +299,130 @@ fn quoted_values_have_their_quotes_removed() {
             .conditions[0]
             .value,
         Value::Text("ada@example.com".to_string())
+    );
+}
+
+// --- inserts (T10) ---
+
+#[test]
+fn an_insert_parses_its_values_and_is_a_non_destructive_write() {
+    let intent = parsed(
+        "add a user with id is 8 and email is ada2@example.com and full name is Ada Lovelace",
+    );
+
+    assert_eq!(intent.operation, Operation::Insert);
+    assert_eq!(intent.table, "users");
+    assert!(intent.is_write(), "an insert changes data");
+    assert!(
+        !intent.is_destructive(),
+        "an insert creates a record and destroys nothing"
+    );
+
+    assert_eq!(intent.assignments.len(), 3);
+    assert_eq!(intent.assignments[0].column, "id");
+    assert_eq!(intent.assignments[0].value, Value::Integer(8));
+    assert_eq!(
+        intent.assignments[2].value,
+        Value::Text("Ada Lovelace".to_string()),
+        "the value keeps the case the user typed"
+    );
+}
+
+#[test]
+fn insert_accepts_commas_as_well_as_and() {
+    let intent = parsed("insert into users with id = 9, email = z@example.com");
+    assert_eq!(intent.assignments.len(), 2);
+    assert_eq!(intent.assignments[1].column, "email");
+}
+
+#[test]
+fn an_insert_with_no_values_is_refused() {
+    assert!(matches!(
+        error("add a user"),
+        ParseError::MissingValues { .. }
+    ));
+}
+
+#[test]
+fn an_insert_cannot_carry_a_condition() {
+    // Selecting records makes no sense for a record that does not exist yet.
+    assert!(matches!(
+        error("add a user with id is 8 where active is true"),
+        ParseError::FilterOnInsert
+    ));
+}
+
+// --- updates (T10) ---
+
+#[test]
+fn an_update_parses_its_values_and_its_filter() {
+    let intent = parsed("update users set active to false where id is 3");
+
+    assert_eq!(intent.operation, Operation::Update);
+    assert_eq!(intent.table, "users");
+    assert!(intent.is_write());
+    assert!(
+        intent.is_destructive(),
+        "an update overwrites values that were there before"
+    );
+
+    assert_eq!(intent.assignments.len(), 1);
+    assert_eq!(intent.assignments[0].column, "active");
+    assert_eq!(intent.assignments[0].value, Value::Boolean(false));
+
+    assert_eq!(intent.filter.conditions.len(), 1);
+    assert_eq!(intent.filter.conditions[0].column, "id");
+}
+
+#[test]
+fn an_update_supports_the_set_for_form() {
+    let intent = parsed("set active to true for users where id is 3");
+    assert_eq!(intent.operation, Operation::Update);
+    assert_eq!(intent.table, "users");
+    assert_eq!(intent.assignments[0].column, "active");
+    assert_eq!(intent.filter.conditions.len(), 1);
+}
+
+#[test]
+fn an_unfiltered_update_parses_and_says_it_touches_everything() {
+    let intent = parsed("update users set active to false");
+    assert!(intent.filter.matches_everything());
+    assert_eq!(
+        intent.describe(),
+        "Update every record in users, setting active = false"
+    );
+}
+
+#[test]
+fn an_update_with_no_values_is_refused() {
+    assert!(matches!(
+        error("update users"),
+        ParseError::MissingValues { .. }
+    ));
+}
+
+#[test]
+fn an_assignment_to_an_unknown_column_is_refused() {
+    assert!(matches!(
+        error("update users set favourite colour to blue"),
+        ParseError::UnknownColumn { .. }
+    ));
+}
+
+#[test]
+fn an_assignment_value_that_does_not_fit_its_column_is_refused() {
+    assert!(matches!(
+        error("update users set id to banana where id is 3"),
+        ParseError::UnparseableValue { .. }
+    ));
+}
+
+#[test]
+fn written_values_keep_their_case_and_are_never_treated_as_syntax() {
+    let intent = parsed("update users set full name to O'Brien; DROP TABLE users where id is 1");
+    assert_eq!(
+        intent.assignments[0].value,
+        Value::Text("O'Brien; DROP TABLE users".to_string()),
+        "a written value is data, to be bound as a parameter"
     );
 }

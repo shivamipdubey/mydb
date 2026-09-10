@@ -29,6 +29,7 @@ fn read(table: &str, column: &str, comparison: Comparison, value: Value) -> Inte
                 value,
             }],
         },
+        assignments: Vec::new(),
     }
 }
 

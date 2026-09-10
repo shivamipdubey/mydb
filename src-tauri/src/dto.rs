@@ -79,6 +79,10 @@ pub enum CommandOutcome {
     NeedsConfirmation {
         /// The intent in plain language (docs/12).
         description: String,
+        /// Which operation this is, so the interface can say "will be
+        /// created" rather than "will be affected" for a record that does
+        /// not exist yet.
+        operation: String,
         affected: RecordsView,
         /// Whether this destroys data, which decides how loudly the interface
         /// says so.
