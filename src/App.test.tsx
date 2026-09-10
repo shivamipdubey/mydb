@@ -72,6 +72,7 @@ function mockBackend(overrides: Record<string, unknown> = {}) {
         return {
           description: "Delete records in users where active is false",
           rowsAffected: 2,
+          historyWarning: null,
         };
       case "cancel_command":
         return "Delete records in users where active is false";

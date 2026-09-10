@@ -16,7 +16,10 @@ async-trait = "0.1"
 mydb-adapters = { workspace = true, features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
+tempfile = "3"
+serde_json = { workspace = true }
 mydb-parser = { workspace = true }
+mydb-storage = { workspace = true }
 
 [lints]
 workspace = true

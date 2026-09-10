@@ -153,6 +153,13 @@ export function App() {
               {executed.rowsAffected === 1 ? "record" : "records"} affected.
             </div>
           )}
+
+          {executed?.historyWarning && (
+            <p className="warning">
+              <span aria-hidden="true">⚠</span> The change ran, but could not be
+              recorded in the command history: {executed.historyWarning}
+            </p>
+          )}
         </section>
 
         {outcome?.kind === "readComplete" && (

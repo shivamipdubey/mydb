@@ -16,6 +16,17 @@ id, connection id, encrypted credential blob, key reference. Never a plaintext f
 ## roles
 id, connection id, user identifier, role (admin or viewer). One row per user per connection.
 
+## command_history (phase 1 only)
+Phase 1 has no audit log. It has a basic command history (docs/03-phases-roadmap.md) holding five fields per executed write: recorded at, connection, operation type, intent summary, result.
+
+Stored as one JSON object per line in `command-history.jsonl`, in the same directory as the connection list. One object per line rather than a JSON array, because appending to an array means rewriting the file, which is the one thing an append-only log should never do. It also means the file can be read with `cat` while there is no viewer screen.
+
+What it deliberately does not hold: before or after state, affected row data, or any restore action. Storing a driver's error message is also avoided, because a database error can carry row values inside it, such as the key value in a duplicate-key violation, and that would smuggle row data into a store that must not have any. A failure records only that it failed.
+
+Written only after an operation has been attempted, and for both outcomes: a refused write is recorded as a failure, never as a success. A cancelled command, a command refused before reaching the database, and any read leave no entry at all.
+
+The `audit_log` and `recovery_bin` below replace this in phase 2. This is not a smaller version of them, and nothing should treat it as one.
+
 ## audit_log
 id, connection id, timestamp, operation type, intent summary, before state (full or reference), after state (full or reference), result (success or failure), size tier (small or large).
 

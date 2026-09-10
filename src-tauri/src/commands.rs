@@ -9,7 +9,7 @@ use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
 use mydb_adapters::{Adapter, Preview, PreviewBody, RecordSet};
 use mydb_confirmation::ExtraStep;
 use mydb_core::{Engine, Schema, Secret};
-use mydb_storage::{Connection, ConnectionStore};
+use mydb_storage::{CommandHistory, Connection, ConnectionStore, Outcome};
 use tauri::State;
 
 use crate::dto::{
@@ -377,15 +377,59 @@ pub async fn confirm_command(
         .as_ref()
         .ok_or_else(|| "the connection was closed before this could run".to_string())?;
 
-    let completed = pending
+    // Kept before confirming, which consumes the pending write.
+    let intent = pending.intent().clone();
+    let attempt = pending
         .confirm(active.adapter.as_ref(), &authorization)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await;
+
+    // Recorded after the attempt finished, whichever way it went, and never
+    // before. docs/16 item 7 forbids logging something that might not have
+    // happened; a failed write did happen and is recorded as a failure.
+    //
+    // A history that cannot be written must not turn a completed write into a
+    // reported failure, so the problem is surfaced separately from the
+    // outcome of the write itself.
+    let recorded = record_history(
+        &active.name,
+        &intent,
+        match attempt {
+            Ok(_) => Outcome::Success,
+            Err(_) => Outcome::Failure,
+        },
+    );
+
+    let completed = attempt.map_err(|error| error.to_string())?;
+
+    if let Err(problem) = recorded {
+        return Ok(ExecutionSummary {
+            description: completed.description,
+            rows_affected: completed.outcome.rows_affected,
+            history_warning: Some(problem),
+        });
+    }
 
     Ok(ExecutionSummary {
         description: completed.description,
         rows_affected: completed.outcome.rows_affected,
+        history_warning: None,
     })
+}
+
+/// Appends one entry to the basic command history (docs/03, phase 1).
+///
+/// Not the audit log. That, with before and after state and the recovery bin
+/// behind it, is phase 2 (docs/07-audit-log-and-recovery-bin.md).
+fn record_history(
+    connection: &str,
+    intent: &mydb_core::Intent,
+    outcome: Outcome,
+) -> Result<(), String> {
+    CommandHistory::open_default()
+        .map_err(|error| error.to_string())?
+        .record_intent(connection, intent, outcome)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Discards the pending write (docs/05 step 9).

@@ -6,5 +6,7 @@
 //! encryption that is not there. The audit log and recovery bin are phase 2.
 
 mod connections;
+mod history;
 
 pub use connections::{Connection, ConnectionStore, ConnectionStoreError};
+pub use history::{CommandHistory, HistoryEntry, HistoryError, Outcome};

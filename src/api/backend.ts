@@ -115,6 +115,8 @@ export type CommandOutcome =
 export interface ExecutionSummary {
   description: string;
   rowsAffected: number;
+  /** The write ran, but could not be recorded in the command history. */
+  historyWarning: string | null;
 }
 
 export const backend = {

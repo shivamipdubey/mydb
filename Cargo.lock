@@ -2052,7 +2052,10 @@ dependencies = [
  "mydb-adapters",
  "mydb-core",
  "mydb-parser",
+ "mydb-storage",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-postgres",
@@ -2080,6 +2083,7 @@ dependencies = [
 name = "mydb-storage"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "mydb-core",
  "serde",
