@@ -13,3 +13,6 @@ target/
 # stores them in a plain file per docs/06-credential-vault.md; never commit it)
 *.local.json
 /.mydb/
+
+# Local screenshot scratch, never committed
+.demo/

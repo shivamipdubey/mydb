@@ -24,6 +24,7 @@ mydb-parser = { workspace = true }
 mydb-adapters = { workspace = true }
 mydb-confirmation = { workspace = true }
 mydb-storage = { workspace = true }
+tokio = { version = "1", features = ["sync"] }
 
 [lints]
 workspace = true

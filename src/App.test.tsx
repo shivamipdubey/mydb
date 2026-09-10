@@ -1,11 +1,207 @@
-import { render, screen } from "@testing-library/react";
+/**
+ * Screen-level tests for the safety loop.
+ *
+ * These mock the Tauri command bridge, so they run everywhere including
+ * macOS, where `tauri-driver` cannot run at all (docs/18-testing-strategy.md).
+ * They cover what the user sees and which commands the interface sends; the
+ * real backend behaviour is covered by the Rust integration tests.
+ */
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { mockIPC, clearMocks } from "@tauri-apps/api/mocks";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 import { App } from "./App";
 
-// Phase 1 scaffold smoke test: proves the TS test runner, JSX pipeline, and
-// DOM environment all work before any real screen depends on them.
-describe("App shell", () => {
-  it("renders", () => {
-    render(<App />);
-    expect(screen.getByRole("heading", { name: "MYDB" })).toBeInTheDocument();
+const CONNECTION = {
+  id: "c1",
+  name: "Local test",
+  engine: "PostgreSQL",
+  host: "localhost",
+  port: 55432,
+  database: "mydb_test",
+  username: "mydb_test",
+  production: false,
+};
+
+const AFFECTED = {
+  columns: ["id", "email"],
+  rows: [
+    ["3", "alan@example.com"],
+    ["6", "barbara@example.com"],
+  ],
+  totalCount: 2,
+  truncated: false,
+  statement: 'SELECT "id"::text, "email"::text FROM "public"."users" WHERE "active" = $1',
+};
+
+const NEEDS_CONFIRMATION = {
+  kind: "needsConfirmation",
+  description: "Delete records in users where active is false",
+  affected: AFFECTED,
+  destructive: true,
+  affectsEverything: false,
+  production: false,
+};
+
+/** Records every command the interface sends, so order can be asserted. */
+let sent: string[] = [];
+
+function mockBackend(overrides: Record<string, unknown> = {}) {
+  sent = [];
+  mockIPC((cmd, args) => {
+    sent.push(cmd);
+    if (cmd in overrides) {
+      const value = overrides[cmd];
+      return typeof value === "function"
+        ? (value as (a: unknown) => unknown)(args)
+        : value;
+    }
+    switch (cmd) {
+      case "list_connections":
+        return [CONNECTION];
+      case "active_connection":
+        return { id: "c1", name: "Local test", production: false, tables: [] };
+      case "submit_command":
+      case "edit_command":
+        return NEEDS_CONFIRMATION;
+      case "confirm_command":
+        return {
+          description: "Delete records in users where active is false",
+          rowsAffected: 2,
+        };
+      case "cancel_command":
+        return "Delete records in users where active is false";
+      default:
+        return null;
+    }
+  });
+}
+
+beforeEach(() => {
+  vi.stubGlobal("crypto", { ...globalThis.crypto });
+});
+
+afterEach(() => {
+  clearMocks();
+});
+
+async function submit(text: string) {
+  const user = userEvent.setup();
+  render(<App />);
+  await screen.findByText(/Connected to/);
+  await user.type(screen.getByLabelText("Command"), text);
+  await user.click(screen.getByRole("button", { name: "Run" }));
+  return user;
+}
+
+describe("the confirmation loop", () => {
+  it("shows what a delete would affect, in plain language, before anything runs", async () => {
+    mockBackend();
+    await submit("delete users where active is false");
+
+    expect(
+      await screen.findByText("Delete records in users where active is false"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("2 records will be affected.")).toBeInTheDocument();
+
+    // The actual records, not just a count.
+    expect(screen.getByText("alan@example.com")).toBeInTheDocument();
+    expect(screen.getByText("barbara@example.com")).toBeInTheDocument();
+
+    // And nothing has run.
+    expect(sent).not.toContain("confirm_command");
+  });
+
+  it("offers confirm, edit, and cancel", async () => {
+    mockBackend();
+    await submit("delete users where active is false");
+
+    await screen.findByRole("button", { name: "Confirm" });
+    expect(screen.getByRole("button", { name: "Edit command" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("labels a destructive change with more than colour", async () => {
+    mockBackend();
+    await submit("delete users where active is false");
+    // docs/12: colour alone is never the only signal.
+    expect(await screen.findByText(/Destructive/)).toBeInTheDocument();
+  });
+
+  it("runs the write only after confirm is pressed", async () => {
+    mockBackend();
+    const user = await submit("delete users where active is false");
+
+    await user.click(await screen.findByRole("button", { name: "Confirm" }));
+
+    await waitFor(() => expect(sent).toContain("confirm_command"));
+    expect(sent.indexOf("submit_command")).toBeLessThan(sent.indexOf("confirm_command"));
+    expect(await screen.findByText(/2 records affected/)).toBeInTheDocument();
+  });
+
+  it("cancel discards the change and says nothing was altered", async () => {
+    mockBackend();
+    const user = await submit("delete users where active is false");
+
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(await screen.findByText(/Nothing was changed/)).toBeInTheDocument();
+    expect(sent).toContain("cancel_command");
+    expect(sent).not.toContain("confirm_command");
+  });
+
+  it("edit returns to a fresh preview rather than executing", async () => {
+    mockBackend();
+    const user = await submit("delete users where active is false");
+
+    await user.click(await screen.findByRole("button", { name: "Edit command" }));
+    const field = await screen.findByLabelText("Revise the command");
+    await user.clear(field);
+    await user.type(field, "delete users where id is 3");
+    await user.click(screen.getByRole("button", { name: "Preview again" }));
+
+    await waitFor(() => expect(sent).toContain("edit_command"));
+    expect(sent).not.toContain("confirm_command");
+    expect(await screen.findByRole("button", { name: "Confirm" })).toBeInTheDocument();
+  });
+
+  it("calls out a filter that matches the whole table", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        description: "Delete every record in users",
+        affectsEverything: true,
+      },
+    });
+    await submit("delete all users");
+
+    expect(await screen.findByText(/affects every\s+record in the table/)).toBeInTheDocument();
+  });
+
+  it("shows a parse error instead of guessing", async () => {
+    mockBackend({
+      submit_command: () => {
+        throw "no table called \"invoices\". This connection has: users, orders";
+      },
+    });
+    await submit("delete every invoice");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/no table called/);
+    expect(screen.queryByRole("button", { name: "Confirm" })).not.toBeInTheDocument();
+  });
+
+  it("a read shows its result with no confirmation step", async () => {
+    mockBackend({
+      submit_command: {
+        kind: "readComplete",
+        description: "Show every record in users",
+        records: AFFECTED,
+      },
+    });
+    await submit("show me all users");
+
+    expect(await screen.findByText("2 records found.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Confirm" })).not.toBeInTheDocument();
   });
 });

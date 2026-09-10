@@ -39,6 +39,8 @@ Continuous integration builds and tests on Windows, macOS, and Linux on every co
 - End-to-end frontend tests with the Tauri command bridge mocked: all three platforms. These cover the screen-level flow anywhere, including macOS, but they do not exercise the real backend.
 - The full command-to-confirm-to-execute flow against real Postgres on macOS is verified manually, which docs/25-exit-conditions-definition-of-done.md requires for phase 1 regardless.
 
+The end-to-end path from typed text through parser, preview, cancel, and confirmed execution is covered by an integration test against real Postgres, so the backend half of the phase 1 exit condition is verified automatically. The interface half is verified by hand on macOS, for the WebDriver reason above.
+
 A dependency audit job runs `cargo audit` and `npm audit` per docs/16-security-and-cybersafety-checklist.md, item 6.
 
 ## The Postgres test instance

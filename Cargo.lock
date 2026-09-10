@@ -2041,6 +2041,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-log",
+ "tokio",
 ]
 
 [[package]]
@@ -2050,9 +2051,11 @@ dependencies = [
  "async-trait",
  "mydb-adapters",
  "mydb-core",
+ "mydb-parser",
  "serde",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

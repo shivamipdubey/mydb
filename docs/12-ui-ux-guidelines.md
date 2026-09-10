@@ -18,6 +18,19 @@ The interface should be structured so panels and sections can be rearranged or a
 - Affected records must be visibly listed or clearly counted, never just implied.
 - The confirm button is disabled until any required extra steps (production flag, role check) are satisfied.
 
+## What phase 1 built
+The shell renders panels in a column: connections, command entry, and, when there is one, a result or a preview. Each is an independent component, so a later phase adds a panel without touching the others.
+
+Decisions worth keeping:
+
+- A SQL NULL renders as a distinct marker, not an empty cell. A user judging whether a preview matches what they meant needs to tell an absent value from a blank one.
+- A filter that matches the whole table gets its own warning line, separate from the record count. An unfiltered delete is the most damaging thing a user can confirm by accident and should never look like an ordinary filtered one.
+- A preview matching zero records says so in plain words rather than showing an empty table, because that usually means the filter is wrong.
+- When more records are affected than are listed, the interface says the count above is exact. The sample is capped; the count never is.
+- Editing a command produces a fresh preview screen rather than reusing the previous one, so a revised command is never shown alongside the earlier command's state.
+- The confirm button carries the destructive styling; edit and cancel are secondary. Cancel states plainly that nothing was changed.
+- Buttons are named for what they act on, "Edit command" against "Edit connection", so no two controls on screen share a label.
+
 ## Accessibility
 - Every action reachable by typing must also be reachable without voice, and vice versa where feasible.
 - Color alone must never be the only signal for a production-flagged connection or a pending destructive action; use a label or icon alongside color.
