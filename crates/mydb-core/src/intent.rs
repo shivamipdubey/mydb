@@ -31,6 +31,10 @@ pub enum Operation {
     Delete,
     Insert,
     Update,
+    /// Removes a table: its records and its structure.
+    DropTable,
+    /// Removes every record from a table, leaving the table itself.
+    Truncate,
 }
 
 impl Operation {
@@ -44,7 +48,11 @@ impl Operation {
     pub fn is_write(self) -> bool {
         match self {
             Operation::Read => false,
-            Operation::Delete | Operation::Insert | Operation::Update => true,
+            Operation::Delete
+            | Operation::Insert
+            | Operation::Update
+            | Operation::DropTable
+            | Operation::Truncate => true,
         }
     }
 
@@ -59,7 +67,9 @@ impl Operation {
     pub fn is_destructive(self) -> bool {
         match self {
             Operation::Read | Operation::Insert => false,
-            Operation::Delete | Operation::Update => true,
+            Operation::Delete | Operation::Update | Operation::DropTable | Operation::Truncate => {
+                true
+            }
         }
     }
 
@@ -69,6 +79,17 @@ impl Operation {
             Operation::Delete => "delete",
             Operation::Insert => "insert",
             Operation::Update => "update",
+            Operation::DropTable => "drop_table",
+            Operation::Truncate => "truncate",
+        }
+    }
+
+    /// Whether this acts on the table itself rather than on a set of
+    /// records, which decides what shape its preview takes (docs/04).
+    pub fn is_schema_change(self) -> bool {
+        match self {
+            Operation::DropTable | Operation::Truncate => true,
+            Operation::Read | Operation::Delete | Operation::Insert | Operation::Update => false,
         }
     }
 }
@@ -301,6 +322,12 @@ impl Intent {
                         self.describe_assignments()
                     )
                 }
+            }
+            Operation::DropTable => {
+                format!("Drop the table {table}, removing its records and its structure")
+            }
+            Operation::Truncate => {
+                format!("Remove every record from {table}, keeping the table itself")
             }
         }
     }

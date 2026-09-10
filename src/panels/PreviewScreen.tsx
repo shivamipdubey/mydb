@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import type { CommandOutcome } from "../api/backend";
 import { RecordTable } from "./RecordTable";
+import { TableOutline } from "./TableOutline";
 
 /**
  * The preview screen (docs/05-confirmation-workflow.md step 5 onward).
@@ -28,8 +29,9 @@ export function PreviewScreen({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
-  const { affected } = outcome;
-  const count = affected.totalCount;
+  const { preview } = outcome;
+  const isSchemaChange = preview.previewKind === "table";
+  const count = isSchemaChange ? preview.rowCount : preview.totalCount;
 
   // A record being created does not yet exist, so "affected" reads wrongly.
   // Naming the operation is also a second chance for the user to notice a
@@ -61,10 +63,23 @@ export function PreviewScreen({
       <p className="intent">{outcome.description}</p>
 
       <p className={count === 0 ? "affected affected-none" : "affected"}>
-        {count === 0
-          ? "This matches no records. Nothing would change."
-          : `${count} ${count === 1 ? "record" : "records"} ${verb}.`}
+        {isSchemaChange
+          ? count === 0
+            ? "This table is already empty."
+            : `${count} ${count === 1 ? "record" : "records"} will be deleted.`
+          : count === 0
+            ? "This matches no records. Nothing would change."
+            : `${count} ${count === 1 ? "record" : "records"} ${verb}.`}
       </p>
+
+      {outcome.operation === "drop_table" && (
+        // A drop removes the structure too, which no record count conveys.
+        // Someone who reads only the number would miss half of what goes.
+        <p className="warning">
+          <span aria-hidden="true">⚠</span> This removes the table itself, not
+          just its records. Its structure, shown below, goes with it.
+        </p>
+      )}
 
       {outcome.affectsEverything && count > 0 && outcome.operation !== "insert" && (
         <p className="warning">
@@ -73,18 +88,22 @@ export function PreviewScreen({
         </p>
       )}
 
-      {affected.truncated && (
+      {preview.previewKind === "records" && preview.truncated && (
         <p className="note">
-          Showing the first {affected.rows.length} of {count}. The count above is
+          Showing the first {preview.rows.length} of {count}. The count above is
           exact.
         </p>
       )}
 
-      <RecordTable records={affected} />
+      {preview.previewKind === "records" ? (
+        <RecordTable records={preview} />
+      ) : (
+        <TableOutline table={preview} />
+      )}
 
       <details className="syntax">
         <summary>Show the query MYDB read this from</summary>
-        <pre>{affected.statement}</pre>
+        <pre>{preview.statement}</pre>
       </details>
 
       {editing ? (

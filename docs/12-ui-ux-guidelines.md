@@ -29,6 +29,7 @@ Decisions worth keeping:
 - When more records are affected than are listed, the interface says the count above is exact. The sample is capped; the count never is.
 - Editing a command produces a fresh preview screen rather than reusing the previous one, so a revised command is never shown alongside the earlier command's state.
 - The confirm button carries the destructive styling; edit and cancel are secondary. Cancel states plainly that nothing was changed.
+- A drop is shown with its table's structure and a warning that the table itself goes, not only its records. Someone reading the record count alone would miss half of what is lost. A truncate shows the same structure but says the table remains.
 - Buttons are named for what they act on, "Edit command" against "Edit connection", so no two controls on screen share a label.
 
 ## Accessibility

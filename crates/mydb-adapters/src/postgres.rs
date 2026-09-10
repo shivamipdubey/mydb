@@ -11,7 +11,9 @@ use crate::sql::{
     as_driver_params, build_insert, build_set, build_where, can_write_to, quote_identifier,
     quote_table,
 };
-use crate::{Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview};
+use crate::{
+    Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, TableOutline,
+};
 
 /// Everything needed to reach one Postgres database.
 ///
@@ -191,6 +193,7 @@ impl Adapter for PostgresAdapter {
             // loudly rather than quietly previewing.
             Operation::Update => self.preview_update(intent).await,
             Operation::Insert => self.preview_insert(intent).await,
+            Operation::DropTable | Operation::Truncate => self.preview_table(intent).await,
             // A read needs no preview: docs/05 step 4 runs it directly and
             // shows the result. Reaching here means the workflow routed a
             // read down the write path, which is a logic error worth failing
@@ -210,6 +213,14 @@ impl Adapter for PostgresAdapter {
             Operation::Delete => self.execute_delete(intent).await,
             Operation::Update => self.execute_update(intent).await,
             Operation::Insert => self.execute_insert(intent).await,
+            // A schema operation destroys everything in the table, so the
+            // count it reports is the one the user was shown in the preview.
+            // Postgres reports no affected rows for DDL, and saying "0
+            // records" after emptying a table would be plainly wrong.
+            Operation::DropTable | Operation::Truncate => {
+                self.execute_schema_change(intent, approved.preview().affected_count())
+                    .await
+            }
             Operation::Read => Err(AdapterError::Unsupported(
                 "a read is not an executable write".to_string(),
             )),
@@ -548,5 +559,77 @@ impl PostgresAdapter {
 
         transaction.commit().await.map_err(describe_query_failure)?;
         Ok(ExecutionOutcome { rows_affected })
+    }
+}
+
+impl PostgresAdapter {
+    /// The DROP TABLE and TRUNCATE preview: the table's current schema and
+    /// row count (docs/04-database-adapters.md).
+    ///
+    /// Not a list of matching records, for two reasons. Neither operation has
+    /// a filter to match against, and a DROP TABLE removes the structure as
+    /// well as the data, so the structure is part of what the user is being
+    /// asked to agree to lose.
+    async fn preview_table(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        let schema_columns = columns_of(
+            &self
+                .describe_table(&intent.namespace, &intent.table)
+                .await?,
+        );
+        let table = quote_table(&intent.namespace, &intent.table);
+
+        let count_sql = format!("SELECT count(*) AS total FROM {table}");
+        let row_count: i64 = self
+            .client
+            .lock()
+            .await
+            .query_one(&count_sql, &[])
+            .await
+            .map_err(describe_query_failure)?
+            .get("total");
+
+        Ok(Preview::of_table(
+            intent.clone(),
+            TableOutline::new(schema_columns, row_count.max(0) as u64, count_sql),
+        ))
+    }
+
+    /// Runs a confirmed DROP TABLE or TRUNCATE inside a transaction.
+    ///
+    /// Postgres supports transactional DDL, so these get the same
+    /// all-or-nothing guarantee docs/04 requires of every other write.
+    ///
+    /// The table name is an identifier read from the catalog and quoted, not
+    /// user text, and there is no value to bind: these statements take no
+    /// parameters at all.
+    async fn execute_schema_change(
+        &self,
+        intent: &Intent,
+        previewed_rows: u64,
+    ) -> Result<ExecutionOutcome, AdapterError> {
+        // Confirms the table exists and gives the same clear error as every
+        // other operation when it does not.
+        self.describe_table(&intent.namespace, &intent.table)
+            .await?;
+        let table = quote_table(&intent.namespace, &intent.table);
+
+        let sql = match intent.operation {
+            Operation::DropTable => format!("DROP TABLE {table}"),
+            Operation::Truncate => format!("TRUNCATE TABLE {table}"),
+            // Unreachable through the trait, which routes only these two
+            // here. Returning rather than panicking keeps docs/17's rule that
+            // this layer never throws into the UI.
+            other => {
+                return Err(AdapterError::Unsupported(format!(
+                    "{} is not a schema change",
+                    other.verb()
+                )))
+            }
+        };
+
+        self.in_transaction(&sql, &[]).await?;
+        Ok(ExecutionOutcome {
+            rows_affected: previewed_rows,
+        })
     }
 }

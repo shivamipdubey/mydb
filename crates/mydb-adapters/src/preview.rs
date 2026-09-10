@@ -17,22 +17,93 @@
 //! The result is that "execute without a preview" is not a bug to be caught in
 //! review. It does not compile.
 
-use mydb_core::Intent;
+use mydb_core::{Column, Intent};
 use serde::{Deserialize, Serialize};
 
 use crate::records::{Record, RecordSet};
+
+/// A table as it stands, for an operation that acts on the table itself
+/// rather than on a set of records.
+///
+/// docs/04-database-adapters.md requires a schema change to preview the
+/// current schema and row count of the affected table. Listing matching
+/// records would be the wrong answer twice over: a DROP TABLE removes the
+/// structure as well as the data, and neither operation has a filter to match
+/// records against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableOutline {
+    columns: Vec<Column>,
+    row_count: u64,
+    statement: String,
+}
+
+impl TableOutline {
+    pub(crate) fn new(columns: Vec<Column>, row_count: u64, statement: String) -> Self {
+        Self {
+            columns,
+            row_count,
+            statement,
+        }
+    }
+
+    /// Builds an outline without a database, for tests only.
+    #[cfg(feature = "test-support")]
+    pub fn for_testing(columns: Vec<Column>, row_count: u64, statement: String) -> Self {
+        Self::new(columns, row_count, statement)
+    }
+
+    /// The table's current shape, which a DROP TABLE would also remove.
+    pub fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
+    /// How many records the table holds right now.
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+}
+
+/// What a preview is showing.
+///
+/// An enum rather than one shape with unused fields, because the two are
+/// genuinely different questions: "which records will this touch" and "what
+/// is in this table that is about to be destroyed".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
+pub enum PreviewBody {
+    /// The records a write will create, change, or remove.
+    Records(RecordSet),
+    /// The table a schema operation will empty or destroy.
+    Table(TableOutline),
+}
 
 /// What a write would do, shown to the user before anything happens.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preview {
     intent: Intent,
-    affected: RecordSet,
+    body: PreviewBody,
 }
 
 impl Preview {
-    /// Builds a preview. Crate-private on purpose: see the module comment.
+    /// Builds a preview of records. Crate-private on purpose: see the module
+    /// comment.
     pub(crate) fn new(intent: Intent, affected: RecordSet) -> Self {
-        Self { intent, affected }
+        Self {
+            intent,
+            body: PreviewBody::Records(affected),
+        }
+    }
+
+    /// Builds a preview of a whole table, for a schema operation.
+    pub(crate) fn of_table(intent: Intent, outline: TableOutline) -> Self {
+        Self {
+            intent,
+            body: PreviewBody::Table(outline),
+        }
     }
 
     /// Builds a preview without touching a database, for tests only.
@@ -48,39 +119,68 @@ impl Preview {
         Self::new(intent, affected)
     }
 
+    /// Builds a table preview without a database, for tests only.
+    #[cfg(feature = "test-support")]
+    pub fn of_table_for_testing(intent: Intent, outline: TableOutline) -> Self {
+        Self::of_table(intent, outline)
+    }
+
     pub fn intent(&self) -> &Intent {
         &self.intent
     }
 
-    /// The records this write would affect.
-    pub fn affected(&self) -> &RecordSet {
-        &self.affected
+    /// What this preview is showing. Match on this when the two cases need
+    /// to be told apart, which the interface does.
+    pub fn body(&self) -> &PreviewBody {
+        &self.body
     }
 
+    /// The records this write would affect, when it affects records.
+    ///
+    /// `None` for a schema operation, which acts on the table itself.
+    pub fn records(&self) -> Option<&RecordSet> {
+        match &self.body {
+            PreviewBody::Records(records) => Some(records),
+            PreviewBody::Table(_) => None,
+        }
+    }
+
+    /// The columns of the affected records, or an empty slice for a schema
+    /// operation. Use [`Preview::body`] when the difference matters.
     pub fn columns(&self) -> &[String] {
-        self.affected.columns()
+        self.records().map(RecordSet::columns).unwrap_or(&[])
     }
 
-    /// The sample of affected records.
+    /// The sample of affected records, or an empty slice for a schema
+    /// operation.
     pub fn rows(&self) -> &[Record] {
-        self.affected.records()
+        self.records().map(RecordSet::records).unwrap_or(&[])
     }
 
-    /// Exactly how many records the write will affect. Never an estimate, and
-    /// never just the length of the sample above.
+    /// Exactly how many records this will destroy or change. Never an
+    /// estimate, and never just the length of a sample.
+    ///
+    /// For a schema operation this is the table's current row count, which is
+    /// what a DROP TABLE or TRUNCATE will remove.
     pub fn affected_count(&self) -> u64 {
-        self.affected.total_count()
+        match &self.body {
+            PreviewBody::Records(records) => records.total_count(),
+            PreviewBody::Table(outline) => outline.row_count(),
+        }
     }
 
     /// Whether more records are affected than are listed.
     pub fn is_truncated(&self) -> bool {
-        self.affected.is_truncated()
+        self.records().is_some_and(RecordSet::is_truncated)
     }
 
     /// The read that produced this preview, for the expandable raw-syntax
     /// detail docs/12-ui-ux-guidelines.md allows as secondary information.
     pub fn statement(&self) -> &str {
-        self.affected.statement()
+        match &self.body {
+            PreviewBody::Records(records) => records.statement(),
+            PreviewBody::Table(outline) => outline.statement(),
+        }
     }
 
     /// Whether this write would affect nothing at all.
@@ -88,7 +188,7 @@ impl Preview {
     /// Worth surfacing distinctly: a user who expected to delete something and
     /// is shown zero rows has almost certainly written the wrong filter.
     pub fn affects_nothing(&self) -> bool {
-        self.affected.is_empty()
+        self.affected_count() == 0
     }
 
     /// Marks this preview as confirmed by the user, producing the token

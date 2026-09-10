@@ -6,14 +6,14 @@
 //! for real rather than by the interface choosing to behave.
 
 use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
-use mydb_adapters::{Adapter, RecordSet};
+use mydb_adapters::{Adapter, Preview, PreviewBody, RecordSet};
 use mydb_core::{Engine, Schema, Secret};
 use mydb_storage::{Connection, ConnectionStore};
 use tauri::State;
 
 use crate::dto::{
-    ActiveConnectionInfo, CommandOutcome, ConnectionInput, ConnectionSummary, ExecutionSummary,
-    RecordsView, TableSummary,
+    ActiveConnectionInfo, ColumnView, CommandOutcome, ConnectionInput, ConnectionSummary,
+    ExecutionSummary, PreviewView, RecordsView, TableSummary, TableView,
 };
 use crate::state::{ActiveConnection, AppState};
 
@@ -49,6 +49,26 @@ fn view(records: &RecordSet) -> RecordsView {
         total_count: records.total_count(),
         truncated: records.is_truncated(),
         statement: records.statement().to_string(),
+    }
+}
+
+/// Renders a preview for the interface, keeping the two shapes distinct.
+fn preview_view(preview: &Preview) -> PreviewView {
+    match preview.body() {
+        PreviewBody::Records(records) => PreviewView::Records(view(records)),
+        PreviewBody::Table(outline) => PreviewView::Table(TableView {
+            columns: outline
+                .columns()
+                .iter()
+                .map(|column| ColumnView {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+                .collect(),
+            row_count: outline.row_count(),
+            statement: outline.statement().to_string(),
+        }),
     }
 }
 
@@ -285,7 +305,7 @@ async fn run_command(state: &AppState, text: String) -> UiResult<CommandOutcome>
             let outcome = CommandOutcome::NeedsConfirmation {
                 description: pending.description(),
                 operation: pending.intent().operation.verb().to_string(),
-                affected: view(pending.preview().affected()),
+                preview: preview_view(pending.preview()),
                 destructive: pending.intent().is_destructive(),
                 affects_everything: pending.intent().filter.matches_everything(),
                 production: active.production,

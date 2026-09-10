@@ -44,6 +44,11 @@ pub enum ParseError {
     #[error("an insert creates a new record, so it cannot have a condition selecting records")]
     FilterOnInsert,
 
+    #[error(
+        "a {operation} applies to the whole table, so it cannot have a condition selecting records"
+    )]
+    FilterNotAllowed { operation: String },
+
     #[error("\"{value}\" is not a valid {expected} for the column {column}")]
     UnparseableValue {
         value: String,

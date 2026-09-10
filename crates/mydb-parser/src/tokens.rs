@@ -1,10 +1,10 @@
 //! Small text helpers shared by the parser's rules.
 
 /// Words that carry no meaning for identifying a table.
-const NOISE_WORDS: [&str; 26] = [
+const NOISE_WORDS: [&str; 31] = [
     "show", "list", "find", "get", "select", "display", "fetch", "read", "delete", "remove",
-    "erase", "insert", "add", "create", "update", "set", "change", "me", "all", "every", "the",
-    "from", "in", "into", "records", "new",
+    "erase", "insert", "add", "create", "update", "set", "change", "drop", "truncate", "empty",
+    "clear", "table", "me", "all", "every", "the", "from", "in", "into", "records", "new",
 ];
 
 /// Reduces a subject phrase to the words that could name a table.

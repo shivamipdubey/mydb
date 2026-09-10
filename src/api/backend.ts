@@ -49,14 +49,36 @@ export interface RecordsView {
   statement: string;
 }
 
+export interface ColumnView {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+}
+
+/** A table about to be emptied or dropped. */
+export interface TableView {
+  columns: ColumnView[];
+  rowCount: number;
+  statement: string;
+}
+
+/**
+ * What a preview is showing. A schema operation and a record operation are
+ * genuinely different questions (docs/04), so they render differently rather
+ * than pretending a dropped table is a list of rows.
+ */
+export type PreviewView =
+  | ({ previewKind: "records" } & RecordsView)
+  | ({ previewKind: "table" } & TableView);
+
 export type CommandOutcome =
   | { kind: "readComplete"; description: string; records: RecordsView }
   | {
       kind: "needsConfirmation";
       description: string;
-      /** "delete", "insert", or "update". */
+      /** "delete", "insert", "update", "drop_table", or "truncate". */
       operation: string;
-      affected: RecordsView;
+      preview: PreviewView;
       destructive: boolean;
       affectsEverything: boolean;
       production: boolean;

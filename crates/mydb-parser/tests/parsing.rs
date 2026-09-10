@@ -220,19 +220,64 @@ fn a_value_that_does_not_fit_its_column_is_rejected() {
 }
 
 #[test]
-fn operations_not_yet_built_are_named_rather_than_misread() {
-    // These must not be silently reinterpreted as some other operation. Each
-    // arrives in a later task with its own preview behaviour.
-    for (input, expected) in [
-        ("truncate users", "TRUNCATE"),
-        ("drop table users", "DROP TABLE"),
-        ("delete table users", "DROP TABLE"),
+fn schema_operations_are_recognised_as_acting_on_the_table() {
+    for input in [
+        "drop table users",
+        "drop the users table",
+        // "delete table users" means the table, not its rows. Reading it as
+        // a row delete would show matching records instead of the structure
+        // that is also about to go.
+        "delete table users",
     ] {
-        match error(input) {
-            ParseError::NotYetSupported { operation } => assert_eq!(operation, expected),
-            other => panic!("expected {expected} to be reported unsupported, got {other:?}"),
-        }
+        let intent = parsed(input);
+        assert_eq!(intent.operation, Operation::DropTable, "{input:?}");
+        assert_eq!(intent.table, "users");
+        assert!(intent.is_destructive());
+        assert!(intent.operation.is_schema_change());
     }
+
+    for input in ["truncate users", "empty the users table", "clear users"] {
+        let intent = parsed(input);
+        assert_eq!(intent.operation, Operation::Truncate, "{input:?}");
+        assert_eq!(intent.table, "users");
+        assert!(intent.is_destructive());
+    }
+}
+
+#[test]
+fn a_row_delete_is_still_a_row_delete() {
+    // The word "table" is what distinguishes the two, and only in the
+    // subject: a row delete must not be promoted to dropping the table.
+    let intent = parsed("delete users where active is false");
+    assert_eq!(intent.operation, Operation::Delete);
+    assert!(!intent.operation.is_schema_change());
+}
+
+#[test]
+fn a_schema_operation_cannot_carry_a_condition() {
+    // "truncate users where active is false" empties the whole table, not
+    // part of it. Accepting the condition would make it look otherwise.
+    for input in [
+        "truncate users where active is false",
+        "drop table users where id is 3",
+    ] {
+        assert!(
+            matches!(error(input), ParseError::FilterNotAllowed { .. }),
+            "{input:?} should be refused rather than silently widened"
+        );
+    }
+}
+
+#[test]
+fn schema_operations_describe_what_survives_and_what_does_not() {
+    assert_eq!(
+        parsed("drop table users").describe(),
+        "Drop the table users, removing its records and its structure"
+    );
+    assert_eq!(
+        parsed("truncate users").describe(),
+        "Remove every record from users, keeping the table itself"
+    );
 }
 
 #[test]

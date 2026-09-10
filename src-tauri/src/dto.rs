@@ -63,6 +63,37 @@ pub struct RecordsView {
     pub statement: String,
 }
 
+/// One column of a table, for a schema operation's preview.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnView {
+    pub name: String,
+    pub data_type: String,
+    pub nullable: bool,
+}
+
+/// A table about to be emptied or dropped: what is in it, and how much.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableView {
+    pub columns: Vec<ColumnView>,
+    pub row_count: u64,
+    pub statement: String,
+}
+
+/// What a preview is showing.
+///
+/// Two shapes, because a schema operation and a record operation are
+/// genuinely different questions (docs/04-database-adapters.md). The
+/// interface renders them differently rather than pretending a dropped
+/// table is a list of rows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "previewKind", rename_all = "camelCase")]
+pub enum PreviewView {
+    Records(RecordsView),
+    Table(TableView),
+}
+
 /// What came back from submitting a command.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -83,7 +114,7 @@ pub enum CommandOutcome {
         /// created" rather than "will be affected" for a record that does
         /// not exist yet.
         operation: String,
-        affected: RecordsView,
+        preview: PreviewView,
         /// Whether this destroys data, which decides how loudly the interface
         /// says so.
         destructive: bool,

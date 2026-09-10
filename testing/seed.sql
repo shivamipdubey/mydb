@@ -39,3 +39,18 @@ INSERT INTO orders (id, user_id, total, placed_at) VALUES
     (2, 2, 130.50, DATE '2024-05-12'),
     (3, 2, 19.99,  DATE '2025-01-03'),
     (4, 5, 87.25,  DATE '2025-09-19');
+
+-- A table with no other table depending on it, so schema-operation tests can
+-- drop and truncate freely without tripping the orders foreign key.
+DROP TABLE IF EXISTS disposable;
+
+CREATE TABLE disposable (
+    id    integer PRIMARY KEY,
+    label text    NOT NULL,
+    note  text
+);
+
+INSERT INTO disposable (id, label, note) VALUES
+    (1, 'first',  NULL),
+    (2, 'second', 'has a note'),
+    (3, 'third',  NULL);

@@ -40,8 +40,15 @@ One difference matters: case folding belongs to comparisons only. A filter match
 
 A column whose type MYDB cannot type a parameter for can still be read and compared as text, but not written. Writing it is refused by name, before any preview, since a preview the user could confirm and then have fail is worse than an early refusal.
 
+### Previewing a schema change
+A schema change previews the table, not a list of records: its current columns, with their types and nullability, and its current row count. Two reasons, both structural rather than stylistic. Neither DROP TABLE nor TRUNCATE has a filter to match records against, so "matching rows" is not a meaningful question. And a DROP TABLE removes the structure as well as the data, so the structure is part of what the user is being asked to agree to lose; a record count alone would describe half of it.
+
+A schema operation cannot carry a condition. "Truncate users where active is false" empties the whole table, not part of it, so the command is refused rather than silently widened.
+
+Postgres supports transactional DDL, so DROP TABLE and TRUNCATE get the same all-or-nothing guarantee as every other write. Neither reports affected rows, so the count MYDB reports afterwards is the one shown in the preview; reporting zero after emptying a table would be plainly wrong.
+
 ### What is implemented for Postgres
-Phase 1: connect, describe schema, a read-only health check, and preview plus execute for DELETE, INSERT, and UPDATE. DROP TABLE and TRUNCATE arrive in T11. The adapter interface deliberately does not expose an execute function until the preview guard that governs it exists, so there is no window in which an adapter can execute without one.
+Phase 1: connect, describe schema, a read-only health check, and preview plus execute for DELETE, INSERT, UPDATE, DROP TABLE, and TRUNCATE. ALTER TABLE is backlogged to phase 2. The adapter interface deliberately does not expose an execute function until the preview guard that governs it exists, so there is no window in which an adapter can execute without one.
 
 The health check reads the server version. docs/13-dashboard-and-health-monitoring.md requires it to be lightweight and strictly read-only, never something that could be mistaken for a data-changing operation.
 

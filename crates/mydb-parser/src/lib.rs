@@ -39,6 +39,9 @@ const INSERT_VERBS: [&str; 3] = ["insert", "add", "create"];
 /// Words that begin an update.
 const UPDATE_VERBS: [&str; 3] = ["update", "set", "change"];
 
+/// Words that begin a truncate.
+const TRUNCATE_VERBS: [&str; 3] = ["truncate", "empty", "clear"];
+
 /// Introduces an insert's values: "add a user with email is ada@example.com".
 const INSERT_INTRODUCER: &str = " with ";
 
@@ -47,11 +50,6 @@ const UPDATE_INTRODUCER: &str = " set ";
 
 /// Separates an update's target from its values in the "set X for Y" form.
 const UPDATE_TARGET_INTRODUCERS: [&str; 3] = [" for ", " on ", " in "];
-
-/// Operations phase 1 does not parse yet. Recognised explicitly so the user is
-/// told the operation is not supported, rather than having their command fail
-/// as unintelligible or, worse, be matched to something else.
-const NOT_YET_SUPPORTED: [(&str, &str); 1] = [("truncate", "TRUNCATE")];
 
 /// Phrases that introduce a filter.
 const FILTER_INTRODUCERS: [&str; 6] = [
@@ -103,17 +101,23 @@ pub fn parse(input: &str, schema: &Schema, engine: Engine) -> Result<Intent, Par
     // rows), so reading it as a row delete would show the wrong preview
     // entirely. Checked against the subject, so a value containing the word
     // cannot trigger it.
-    if operation == Operation::Delete && subject.split_whitespace().any(|word| word == "table") {
-        return Err(ParseError::NotYetSupported {
-            operation: "DROP TABLE".to_string(),
-        });
-    }
+    // "delete table users" means the table, not its rows. Reading it as a row
+    // delete would show the wrong preview entirely: matching records rather
+    // than the structure that is also about to go.
+    let operation =
+        if operation == Operation::Delete && subject.split_whitespace().any(|w| w == "table") {
+            Operation::DropTable
+        } else {
+            operation
+        };
 
     // Where the target table is named, and where the written values are,
     // differ by operation. Splitting here keeps each shape's rules in one
     // place instead of spreading special cases through the resolvers.
     let (target_text, assignment_range) = match operation {
-        Operation::Read | Operation::Delete => (subject, None),
+        Operation::Read | Operation::Delete | Operation::DropTable | Operation::Truncate => {
+            (subject, None)
+        }
         Operation::Insert => split_insert(subject)?,
         Operation::Update => split_update(subject)?,
     };
@@ -132,6 +136,19 @@ pub fn parse(input: &str, schema: &Schema, engine: Engine) -> Result<Intent, Par
 
     if operation == Operation::Insert && !filter.matches_everything() {
         return Err(ParseError::FilterOnInsert);
+    }
+
+    // A schema operation acts on the table as a whole. A condition would
+    // suggest it removes only some records, which is a dangerous thing to be
+    // wrong about: "truncate users where active is false" empties the entire
+    // table, not part of it.
+    if operation.is_schema_change() && !filter.matches_everything() {
+        return Err(ParseError::FilterNotAllowed {
+            operation: match operation {
+                Operation::DropTable => "drop".to_string(),
+                _ => "truncate".to_string(),
+            },
+        });
     }
 
     Ok(Intent {
@@ -295,17 +312,10 @@ fn operation_from_verb(lowered: &str) -> Result<Operation, ParseError> {
         return Ok(Operation::Read);
     }
     if first == "drop" {
-        return Err(ParseError::NotYetSupported {
-            operation: "DROP TABLE".to_string(),
-        });
+        return Ok(Operation::DropTable);
     }
-
-    for (verb, operation) in NOT_YET_SUPPORTED {
-        if first == verb {
-            return Err(ParseError::NotYetSupported {
-                operation: operation.to_string(),
-            });
-        }
+    if TRUNCATE_VERBS.contains(&first) {
+        return Ok(Operation::Truncate);
     }
 
     Err(ParseError::UnknownOperation {

@@ -25,6 +25,7 @@ const CONNECTION = {
 };
 
 const AFFECTED = {
+  previewKind: "records" as const,
   columns: ["id", "email"],
   rows: [
     ["3", "alan@example.com"],
@@ -39,7 +40,7 @@ const NEEDS_CONFIRMATION = {
   kind: "needsConfirmation",
   description: "Delete records in users where active is false",
   operation: "delete",
-  affected: AFFECTED,
+  preview: AFFECTED,
   destructive: true,
   affectsEverything: false,
   production: false,
@@ -200,7 +201,7 @@ describe("the confirmation loop", () => {
         operation: "insert",
         description: "Add one record to users, with email = \"z@example.com\"",
         destructive: false,
-        affected: { ...AFFECTED, rows: [["8", "z@example.com"]], totalCount: 1 },
+        preview: { ...AFFECTED, rows: [["8", "z@example.com"]], totalCount: 1 },
       },
     });
     await submit("add a user with email is z@example.com");
@@ -223,6 +224,58 @@ describe("the confirmation loop", () => {
     expect(await screen.findByText("2 records will be updated.")).toBeInTheDocument();
     // An update overwrites what was there, so it is destructive.
     expect(screen.getByText(/Destructive/)).toBeInTheDocument();
+  });
+
+  it("a drop shows the table's structure and says the table itself goes", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        operation: "drop_table",
+        description: "Drop the table users, removing its records and its structure",
+        preview: {
+          previewKind: "table",
+          columns: [
+            { name: "id", dataType: "integer", nullable: false },
+            { name: "email", dataType: "text", nullable: false },
+          ],
+          rowCount: 7,
+          statement: 'SELECT count(*) AS total FROM "public"."users"',
+        },
+      },
+    });
+    await submit("drop table users");
+
+    expect(await screen.findByText("7 records will be deleted.")).toBeInTheDocument();
+    // The structure is part of what is lost, and a record count alone
+    // would not tell the user that.
+    expect(
+      screen.getByText(/removes the table itself, not\s+just its records/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("integer")).toBeInTheDocument();
+  });
+
+  it("a truncate keeps the table and says so", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        operation: "truncate",
+        description: "Remove every record from users, keeping the table itself",
+        preview: {
+          previewKind: "table",
+          columns: [{ name: "id", dataType: "integer", nullable: false }],
+          rowCount: 7,
+          statement: 'SELECT count(*) AS total FROM "public"."users"',
+        },
+      },
+    });
+    await submit("truncate users");
+
+    expect(await screen.findByText("7 records will be deleted.")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Remove every record from users, keeping the table itself/),
+    ).toBeInTheDocument();
+    // A truncate leaves the table, so it must not carry the drop warning.
+    expect(screen.queryByText(/removes the table itself/)).not.toBeInTheDocument();
   });
 
   it("a read shows its result with no confirmation step", async () => {
