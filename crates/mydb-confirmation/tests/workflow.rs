@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use mydb_adapters::{
     Adapter, AdapterError, ApprovedWrite, ExecutionOutcome, Health, Preview, Record, RecordSet,
 };
-use mydb_confirmation::{begin, Step, WorkflowError};
+use mydb_confirmation::{begin, ExtraStep, Step, WorkflowError};
 use mydb_core::{Comparison, Condition, Engine, Filter, Intent, Operation, Schema, Value};
 
 /// A stub adapter that records every call and can be told to fail.
@@ -117,9 +117,13 @@ fn narrower_delete() -> Intent {
 async fn a_read_runs_directly_and_is_never_offered_for_confirmation() {
     let adapter = StubAdapter::default();
 
-    let step = begin(&adapter, intent(Operation::Read, Filter::everything()))
-        .await
-        .unwrap();
+    let step = begin(
+        &adapter,
+        intent(Operation::Read, Filter::everything()),
+        false,
+    )
+    .await
+    .unwrap();
 
     assert!(matches!(step, Step::ReadComplete(_)));
     assert!(step.awaiting_confirmation().is_none());
@@ -132,7 +136,7 @@ async fn a_read_runs_directly_and_is_never_offered_for_confirmation() {
 async fn a_write_is_previewed_and_nothing_runs_until_confirmed() {
     let adapter = StubAdapter::default();
 
-    let step = begin(&adapter, delete()).await.unwrap();
+    let step = begin(&adapter, delete(), false).await.unwrap();
 
     let pending = step
         .awaiting_confirmation()
@@ -150,11 +154,12 @@ async fn a_write_is_previewed_and_nothing_runs_until_confirmed() {
 #[tokio::test]
 async fn confirm_executes_and_reports_what_happened() {
     let adapter = StubAdapter::default();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete()).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete(), false).await.unwrap()
+    else {
         panic!("expected a pending write");
     };
 
-    let completed = pending.confirm(&adapter).await.unwrap();
+    let completed = pending.confirm(&adapter, "").await.unwrap();
 
     assert_eq!(completed.outcome.rows_affected, 1);
     assert_eq!(completed.description, "Delete every record in users");
@@ -170,7 +175,8 @@ async fn confirm_executes_and_reports_what_happened() {
 #[tokio::test]
 async fn edit_returns_to_the_preview_step_with_the_new_intent() {
     let adapter = StubAdapter::default();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete()).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete(), false).await.unwrap()
+    else {
         panic!("expected a pending write");
     };
 
@@ -198,7 +204,8 @@ async fn edit_returns_to_the_preview_step_with_the_new_intent() {
 #[tokio::test]
 async fn editing_a_write_into_a_read_runs_it_directly() {
     let adapter = StubAdapter::default();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete()).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete(), false).await.unwrap()
+    else {
         panic!("expected a pending write");
     };
 
@@ -216,7 +223,8 @@ async fn editing_a_write_into_a_read_runs_it_directly() {
 #[tokio::test]
 async fn cancel_discards_the_command_without_running_anything() {
     let adapter = StubAdapter::default();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete()).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete(), false).await.unwrap()
+    else {
         panic!("expected a pending write");
     };
 
@@ -239,7 +247,7 @@ async fn a_failed_preview_produces_nothing_that_could_be_confirmed() {
         ..Default::default()
     };
 
-    let result = begin(&adapter, delete()).await;
+    let result = begin(&adapter, delete(), false).await;
 
     assert!(matches!(result, Err(WorkflowError::Preview(_))));
     assert_eq!(
@@ -256,11 +264,12 @@ async fn a_failed_execution_is_reported_as_an_execution_failure() {
         fail_execute: true,
         ..Default::default()
     };
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete()).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete(), false).await.unwrap()
+    else {
         panic!("expected a pending write");
     };
 
-    let result = pending.confirm(&adapter).await;
+    let result = pending.confirm(&adapter, "").await;
 
     assert!(
         matches!(result, Err(WorkflowError::Execution(_))),
@@ -276,12 +285,214 @@ async fn a_confirmation_cannot_be_replayed_into_two_executions() {
     // compiler rather than by a flag. The test documents the guarantee and
     // would fail to compile if confirm were ever changed to take &self.
     let adapter = StubAdapter::default();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete()).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, delete(), false).await.unwrap()
+    else {
         panic!("expected a pending write");
     };
 
-    pending.confirm(&adapter).await.unwrap();
-    // pending.confirm(&adapter).await; // would not compile: value moved
+    pending.confirm(&adapter, "").await.unwrap();
+    // pending.confirm(&adapter, "").await; // would not compile: value moved
 
     assert_eq!(adapter.calls(), ["build_preview", "execute"]);
+}
+
+// --- docs/11: the production flag's extra step, per operation type ---
+
+fn write(operation: Operation) -> Intent {
+    Intent {
+        engine: Engine::Postgres,
+        namespace: "public".to_string(),
+        table: "users".to_string(),
+        operation,
+        filter: Filter::everything(),
+        assignments: Vec::new(),
+    }
+}
+
+/// A stub whose preview reports a chosen number of affected records, so the
+/// gate can be tested at each size that changes which gate applies.
+struct CountingAdapter {
+    inner: StubAdapter,
+    count: u64,
+}
+
+#[async_trait::async_trait]
+impl Adapter for CountingAdapter {
+    async fn describe_schema(&self) -> Result<Schema, AdapterError> {
+        self.inner.describe_schema().await
+    }
+    async fn report_health(&self) -> Health {
+        self.inner.report_health().await
+    }
+    async fn run_read(&self, intent: &Intent) -> Result<RecordSet, AdapterError> {
+        self.inner.run_read(intent).await
+    }
+    async fn build_preview(&self, intent: &Intent) -> Result<Preview, AdapterError> {
+        self.inner.record("build_preview");
+        Ok(Preview::for_testing(
+            intent.clone(),
+            RecordSet::for_testing(
+                vec!["id".to_string()],
+                Vec::new(),
+                self.count,
+                "SELECT".to_string(),
+            ),
+        ))
+    }
+    async fn execute(&self, approved: ApprovedWrite) -> Result<ExecutionOutcome, AdapterError> {
+        self.inner.execute(approved).await
+    }
+}
+
+fn counting(count: u64) -> CountingAdapter {
+    CountingAdapter {
+        inner: StubAdapter::default(),
+        count,
+    }
+}
+
+async fn pending_for(
+    adapter: &CountingAdapter,
+    operation: Operation,
+    production: bool,
+) -> Box<mydb_confirmation::PendingWrite> {
+    match begin(adapter, write(operation), production).await.unwrap() {
+        Step::AwaitingConfirmation(pending) => pending,
+        Step::ReadComplete(_) => panic!("expected a pending write"),
+    }
+}
+
+#[tokio::test]
+async fn an_unflagged_connection_asks_for_nothing_extra() {
+    let adapter = counting(42);
+    for operation in [
+        Operation::Delete,
+        Operation::Update,
+        Operation::DropTable,
+        Operation::Truncate,
+    ] {
+        let pending = pending_for(&adapter, operation, false).await;
+        assert_eq!(pending.extra_step(), &ExtraStep::None, "{operation:?}");
+        assert!(pending.confirm(&adapter, "").await.is_ok(), "{operation:?}");
+    }
+}
+
+#[tokio::test]
+async fn every_destructive_operation_is_gated_on_a_production_connection() {
+    // docs/11's testing requirement, for each destructive operation type.
+    for operation in [
+        Operation::Delete,
+        Operation::Update,
+        Operation::DropTable,
+        Operation::Truncate,
+    ] {
+        let adapter = counting(42);
+
+        // Nothing typed: refused, and nothing ran.
+        let pending = pending_for(&adapter, operation, true).await;
+        assert!(pending.extra_step().is_required(), "{operation:?}");
+        let refused = pending.confirm(&adapter, "").await;
+        assert!(
+            matches!(refused, Err(WorkflowError::ExtraStepNotSatisfied { .. })),
+            "{operation:?} ran without its extra step"
+        );
+        assert!(
+            !adapter.inner.calls().contains(&"execute"),
+            "{operation:?} reached execute despite an unsatisfied gate"
+        );
+
+        // The wrong thing typed: still refused.
+        let pending = pending_for(&adapter, operation, true).await;
+        assert!(pending.confirm(&adapter, "yes please").await.is_err());
+        assert!(!adapter.inner.calls().contains(&"execute"));
+    }
+}
+
+#[tokio::test]
+async fn a_schema_change_is_gated_on_the_table_name() {
+    let adapter = counting(42);
+
+    for operation in [Operation::DropTable, Operation::Truncate] {
+        let pending = pending_for(&adapter, operation, true).await;
+        assert_eq!(
+            pending.extra_step(),
+            &ExtraStep::TableName {
+                table: "users".to_string()
+            }
+        );
+        // The record count is not a way past this one.
+        assert!(pending.confirm(&adapter, "42").await.is_err());
+
+        let pending = pending_for(&adapter, operation, true).await;
+        assert!(pending.confirm(&adapter, "users").await.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn a_large_delete_accepts_the_count_or_the_word() {
+    let adapter = counting(42);
+
+    let pending = pending_for(&adapter, Operation::Delete, true).await;
+    assert_eq!(
+        pending.extra_step(),
+        &ExtraStep::CountOrConfirm { count: 42 }
+    );
+    assert!(pending.confirm(&adapter, "42").await.is_ok());
+
+    let adapter = counting(42);
+    let pending = pending_for(&adapter, Operation::Update, true).await;
+    assert!(pending.confirm(&adapter, "CONFIRM").await.is_ok());
+}
+
+#[tokio::test]
+async fn a_delete_of_one_record_will_not_accept_the_count() {
+    for count in [0, 1] {
+        let adapter = counting(count);
+        let pending = pending_for(&adapter, Operation::Delete, true).await;
+        assert_eq!(pending.extra_step(), &ExtraStep::ConfirmWord);
+
+        assert!(
+            pending.confirm(&adapter, &count.to_string()).await.is_err(),
+            "typing {count} is a keystroke, not friction"
+        );
+        assert!(!adapter.inner.calls().contains(&"execute"));
+
+        let pending = pending_for(&adapter, Operation::Delete, true).await;
+        assert!(pending.confirm(&adapter, "confirm").await.is_ok());
+    }
+}
+
+#[tokio::test]
+async fn an_insert_on_a_production_connection_needs_no_extra_step() {
+    let adapter = counting(1);
+    let pending = pending_for(&adapter, Operation::Insert, true).await;
+    assert_eq!(pending.extra_step(), &ExtraStep::None);
+    assert!(pending.confirm(&adapter, "").await.is_ok());
+}
+
+#[tokio::test]
+async fn editing_re_derives_the_gate_for_the_revised_command() {
+    // A broad delete narrowed to one record must not keep the count gate the
+    // broad version had, and must not become ungated either.
+    let wide = counting(42);
+    let pending = pending_for(&wide, Operation::Delete, true).await;
+    assert_eq!(
+        pending.extra_step(),
+        &ExtraStep::CountOrConfirm { count: 42 }
+    );
+
+    let narrow = counting(1);
+    let Step::AwaitingConfirmation(revised) = pending
+        .edit(&narrow, write(Operation::Delete))
+        .await
+        .unwrap()
+    else {
+        panic!("an edit must return to the preview step");
+    };
+    assert_eq!(
+        revised.extra_step(),
+        &ExtraStep::ConfirmWord,
+        "the revised command's gate comes from its own preview"
+    );
+    assert!(revised.extra_step().is_required(), "still production");
 }

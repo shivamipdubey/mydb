@@ -7,13 +7,14 @@
 
 use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
 use mydb_adapters::{Adapter, Preview, PreviewBody, RecordSet};
+use mydb_confirmation::ExtraStep;
 use mydb_core::{Engine, Schema, Secret};
 use mydb_storage::{Connection, ConnectionStore};
 use tauri::State;
 
 use crate::dto::{
     ActiveConnectionInfo, ColumnView, CommandOutcome, ConnectionInput, ConnectionSummary,
-    ExecutionSummary, PreviewView, RecordsView, TableSummary, TableView,
+    ExecutionSummary, ExtraStepView, PreviewView, RecordsView, TableSummary, TableView,
 };
 use crate::state::{ActiveConnection, AppState};
 
@@ -69,6 +70,23 @@ fn preview_view(preview: &Preview) -> PreviewView {
             row_count: outline.row_count(),
             statement: outline.statement().to_string(),
         }),
+    }
+}
+
+/// Describes the extra step for the interface.
+fn extra_step_view(step: &ExtraStep) -> ExtraStepView {
+    let prompt = step.prompt().unwrap_or_default();
+    match step {
+        ExtraStep::None => ExtraStepView::None,
+        ExtraStep::TableName { table } => ExtraStepView::TableName {
+            table: table.clone(),
+            prompt,
+        },
+        ExtraStep::CountOrConfirm { count } => ExtraStepView::CountOrConfirm {
+            count: *count,
+            prompt,
+        },
+        ExtraStep::ConfirmWord => ExtraStepView::ConfirmWord { prompt },
     }
 }
 
@@ -288,7 +306,10 @@ async fn run_command(state: &AppState, text: String) -> UiResult<CommandOutcome>
     let intent = mydb_parser::parse(&text, &active.schema, Engine::Postgres)
         .map_err(|error| error.to_string())?;
 
-    let step = mydb_confirmation::begin(active.adapter.as_ref(), intent.clone())
+    // The production flag comes from the backend's own record of the
+    // connection, never from the interface, so nothing the frontend sends can
+    // lower the friction on a flagged connection.
+    let step = mydb_confirmation::begin(active.adapter.as_ref(), intent.clone(), active.production)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -306,6 +327,7 @@ async fn run_command(state: &AppState, text: String) -> UiResult<CommandOutcome>
                 description: pending.description(),
                 operation: pending.intent().operation.verb().to_string(),
                 preview: preview_view(pending.preview()),
+                extra_step: extra_step_view(pending.extra_step()),
                 destructive: pending.intent().is_destructive(),
                 affects_everything: pending.intent().filter.matches_everything(),
                 production: active.production,
@@ -322,7 +344,27 @@ async fn run_command(state: &AppState, text: String) -> UiResult<CommandOutcome>
 /// to act on. Combined with `confirm` consuming it, a double-click cannot run
 /// a delete twice.
 #[tauri::command]
-pub async fn confirm_command(state: State<'_, AppState>) -> UiResult<ExecutionSummary> {
+pub async fn confirm_command(
+    state: State<'_, AppState>,
+    authorization: String,
+) -> UiResult<ExecutionSummary> {
+    // Checked before the pending write is taken, so a wrong or missing entry
+    // leaves the preview on screen to try again rather than discarding it and
+    // making the user retype the whole command. The engine checks it again
+    // when confirming; this is for the person, that one is the gate.
+    {
+        let guard = state.pending.lock().await;
+        let pending = guard
+            .as_ref()
+            .ok_or_else(|| "there is nothing waiting to be confirmed".to_string())?;
+        if !pending.extra_step().accepts(&authorization) {
+            return Err(pending
+                .extra_step()
+                .prompt()
+                .unwrap_or_else(|| "this change needs an extra confirmation".to_string()));
+        }
+    }
+
     let pending = state
         .pending
         .lock()
@@ -336,7 +378,7 @@ pub async fn confirm_command(state: State<'_, AppState>) -> UiResult<ExecutionSu
         .ok_or_else(|| "the connection was closed before this could run".to_string())?;
 
     let completed = pending
-        .confirm(active.adapter.as_ref())
+        .confirm(active.adapter.as_ref(), &authorization)
         .await
         .map_err(|error| error.to_string())?;
 

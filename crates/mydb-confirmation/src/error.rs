@@ -19,4 +19,9 @@ pub enum WorkflowError {
 
     #[error("the change was confirmed but could not be completed: {0}")]
     Execution(#[source] AdapterError),
+
+    /// The production flag's extra step was not satisfied
+    /// (docs/11-production-safety-flag.md).
+    #[error("{prompt}")]
+    ExtraStepNotSatisfied { prompt: String },
 }

@@ -101,3 +101,7 @@ button.confirm { background: var(--danger); border-color: var(--danger); color: 
 
 .edit-form { margin-top: .75rem; display: flex; flex-direction: column; gap: .4rem; }
 .edit-form label { font-size: .8rem; color: var(--muted); }
+
+.extra-step { margin-top: .9rem; display: flex; flex-direction: column; gap: .4rem; }
+.extra-step label { font-size: .8rem; color: var(--muted); }
+.extra-step input { max-width: 320px; }

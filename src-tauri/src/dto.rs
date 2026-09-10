@@ -94,6 +94,32 @@ pub enum PreviewView {
     Table(TableView),
 }
 
+/// What the user must type before a write on a production-flagged
+/// connection can run (docs/11-production-safety-flag.md).
+///
+/// The interface uses this to disable the confirm action and to say what is
+/// wanted. It is not the enforcement point: the engine checks the typed value
+/// again, because a gate enforced only in the interface is not a gate.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ExtraStepView {
+    None,
+    #[serde(rename_all = "camelCase")]
+    TableName {
+        table: String,
+        prompt: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    CountOrConfirm {
+        count: u64,
+        prompt: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    ConfirmWord {
+        prompt: String,
+    },
+}
+
 /// What came back from submitting a command.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -115,6 +141,7 @@ pub enum CommandOutcome {
         /// not exist yet.
         operation: String,
         preview: PreviewView,
+        extra_step: ExtraStepView,
         /// Whether this destroys data, which decides how loudly the interface
         /// says so.
         destructive: bool,

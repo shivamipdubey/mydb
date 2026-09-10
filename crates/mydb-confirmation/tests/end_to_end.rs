@@ -11,7 +11,7 @@
 
 use mydb_adapters::postgres::{PostgresAdapter, PostgresConnectionDetails};
 use mydb_adapters::Adapter;
-use mydb_confirmation::{begin, Step};
+use mydb_confirmation::{begin, Step, WorkflowError};
 use mydb_core::Engine;
 
 fn details() -> PostgresConnectionDetails<'static> {
@@ -58,7 +58,7 @@ async fn connect() -> PostgresAdapter {
 /// Runs a read command and reports how many users exist.
 async fn user_count(adapter: &PostgresAdapter, schema: &mydb_core::Schema) -> u64 {
     let intent = mydb_parser::parse("show me all users", schema, Engine::Postgres).unwrap();
-    match begin(adapter, intent).await.unwrap() {
+    match begin(adapter, intent, false).await.unwrap() {
         Step::ReadComplete(records) => records.total_count(),
         Step::AwaitingConfirmation(_) => panic!("a read must not await confirmation"),
     }
@@ -83,7 +83,7 @@ async fn typed_command_to_confirmed_delete_works_end_to_end() {
     assert!(intent.is_write());
 
     // 2. It is previewed, not run.
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, false).await.unwrap() else {
         panic!("a delete must await confirmation");
     };
     assert_eq!(pending.preview().affected_count(), 2);
@@ -112,10 +112,10 @@ async fn typed_command_to_confirmed_delete_works_end_to_end() {
         Engine::Postgres,
     )
     .unwrap();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, false).await.unwrap() else {
         panic!("a delete must await confirmation");
     };
-    let completed = pending.confirm(&adapter).await.unwrap();
+    let completed = pending.confirm(&adapter, "").await.unwrap();
 
     assert_eq!(completed.outcome.rows_affected, 2);
     assert_eq!(user_count(&adapter, &schema).await, 5);
@@ -132,7 +132,7 @@ async fn editing_a_command_re_previews_against_the_real_database() {
 
     // A command that would take the whole table.
     let broad = mydb_parser::parse("delete all users", &schema, Engine::Postgres).unwrap();
-    let Step::AwaitingConfirmation(pending) = begin(&adapter, broad).await.unwrap() else {
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, broad, false).await.unwrap() else {
         panic!("expected a pending write");
     };
     assert_eq!(pending.preview().affected_count(), 7);
@@ -170,4 +170,93 @@ async fn a_command_naming_an_unknown_table_never_reaches_the_database() {
         result.is_err(),
         "an unknown table must be refused before anything is previewed or run"
     );
+}
+
+// --- docs/11: the gate holds against a real database, not just a stub ---
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn a_production_delete_will_not_run_until_its_gate_is_satisfied() {
+    reset_seed().await;
+    let adapter = connect().await;
+    let schema = adapter.describe_schema().await.unwrap();
+
+    let intent = mydb_parser::parse(
+        "delete users where active is false",
+        &schema,
+        Engine::Postgres,
+    )
+    .unwrap();
+
+    // Flagged production: the extra step applies.
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, true).await.unwrap() else {
+        panic!("expected a pending write");
+    };
+    assert_eq!(pending.preview().affected_count(), 2);
+
+    let refused = pending.confirm(&adapter, "").await;
+    assert!(
+        matches!(refused, Err(WorkflowError::ExtraStepNotSatisfied { .. })),
+        "an unsatisfied gate must stop the write"
+    );
+    assert_eq!(
+        user_count(&adapter, &schema).await,
+        7,
+        "nothing may be deleted while the gate is unsatisfied"
+    );
+
+    // Typing the previewed count lets it through.
+    let intent = mydb_parser::parse(
+        "delete users where active is false",
+        &schema,
+        Engine::Postgres,
+    )
+    .unwrap();
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, true).await.unwrap() else {
+        panic!("expected a pending write");
+    };
+    let completed = pending.confirm(&adapter, "2").await.unwrap();
+    assert_eq!(completed.outcome.rows_affected, 2);
+    assert_eq!(user_count(&adapter, &schema).await, 5);
+
+    reset_seed().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Postgres instance; run with --ignored"]
+async fn a_production_drop_is_gated_on_the_table_name() {
+    reset_seed().await;
+    let adapter = connect().await;
+    let schema = adapter.describe_schema().await.unwrap();
+
+    let intent = mydb_parser::parse("drop table disposable", &schema, Engine::Postgres).unwrap();
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, true).await.unwrap() else {
+        panic!("expected a pending write");
+    };
+
+    // The row count is not a way past a schema change's gate.
+    assert!(pending.confirm(&adapter, "3").await.is_err());
+    assert!(
+        adapter
+            .describe_schema()
+            .await
+            .unwrap()
+            .find_table("disposable")
+            .is_some(),
+        "the table must still be there"
+    );
+
+    let intent = mydb_parser::parse("drop table disposable", &schema, Engine::Postgres).unwrap();
+    let Step::AwaitingConfirmation(pending) = begin(&adapter, intent, true).await.unwrap() else {
+        panic!("expected a pending write");
+    };
+    pending.confirm(&adapter, "disposable").await.unwrap();
+    assert!(adapter
+        .describe_schema()
+        .await
+        .unwrap()
+        .find_table("disposable")
+        .is_none());
+
+    reset_seed().await;
 }

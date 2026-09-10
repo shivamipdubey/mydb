@@ -178,9 +178,9 @@ export function App() {
             key={previewSeq}
             outcome={pending}
             busy={busy}
-            onConfirm={() =>
+            onConfirm={(authorization) =>
               run(async () => {
-                const summary = await backend.confirmCommand();
+                const summary = await backend.confirmCommand(authorization);
                 setOutcome(null);
                 setExecuted(summary);
               })

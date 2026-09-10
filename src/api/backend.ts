@@ -71,6 +71,33 @@ export type PreviewView =
   | ({ previewKind: "records" } & RecordsView)
   | ({ previewKind: "table" } & TableView);
 
+/**
+ * What the user must type before a write on a production-flagged connection
+ * can run (docs/11). The interface uses this to disable the confirm action;
+ * the backend checks the typed value again, because a gate enforced only in
+ * the interface is not a gate.
+ */
+export type ExtraStep =
+  | { kind: "none" }
+  | { kind: "tableName"; table: string; prompt: string }
+  | { kind: "countOrConfirm"; count: number; prompt: string }
+  | { kind: "confirmWord"; prompt: string };
+
+/** Whether what was typed satisfies the step, mirroring the backend rule. */
+export function extraStepSatisfied(step: ExtraStep, typed: string): boolean {
+  const value = typed.trim();
+  switch (step.kind) {
+    case "none":
+      return true;
+    case "tableName":
+      return value.length > 0 && value.toLowerCase() === step.table.toLowerCase();
+    case "countOrConfirm":
+      return value === String(step.count) || value.toLowerCase() === "confirm";
+    case "confirmWord":
+      return value.toLowerCase() === "confirm";
+  }
+}
+
 export type CommandOutcome =
   | { kind: "readComplete"; description: string; records: RecordsView }
   | {
@@ -79,6 +106,7 @@ export type CommandOutcome =
       /** "delete", "insert", "update", "drop_table", or "truncate". */
       operation: string;
       preview: PreviewView;
+      extraStep: ExtraStep;
       destructive: boolean;
       affectsEverything: boolean;
       production: boolean;
@@ -100,7 +128,8 @@ export const backend = {
   activeConnection: () => invoke<ActiveConnectionInfo | null>("active_connection"),
   submitCommand: (text: string) => invoke<CommandOutcome>("submit_command", { text }),
   editCommand: (text: string) => invoke<CommandOutcome>("edit_command", { text }),
-  confirmCommand: () => invoke<ExecutionSummary>("confirm_command"),
+  confirmCommand: (authorization: string) =>
+    invoke<ExecutionSummary>("confirm_command", { authorization }),
   cancelCommand: () => invoke<string>("cancel_command"),
 };
 

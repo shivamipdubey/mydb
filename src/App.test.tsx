@@ -41,6 +41,7 @@ const NEEDS_CONFIRMATION = {
   description: "Delete records in users where active is false",
   operation: "delete",
   preview: AFFECTED,
+  extraStep: { kind: "none" },
   destructive: true,
   affectsEverything: false,
   production: false,
@@ -276,6 +277,101 @@ describe("the confirmation loop", () => {
     ).toBeInTheDocument();
     // A truncate leaves the table, so it must not carry the drop warning.
     expect(screen.queryByText(/removes the table itself/)).not.toBeInTheDocument();
+  });
+
+  // --- docs/11: the production flag's extra step ---
+
+  it("a production delete keeps confirm disabled until the count or CONFIRM is typed", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        production: true,
+        extraStep: {
+          kind: "countOrConfirm",
+          count: 2,
+          prompt: "This connection is flagged production. Type 2 or the word CONFIRM to continue.",
+        },
+      },
+    });
+    const user = await submit("delete users where active is false");
+
+    const confirm = await screen.findByRole("button", { name: "Confirm" });
+    expect(confirm).toBeDisabled();
+
+    // A wrong entry does not unlock it.
+    const field = screen.getByLabelText("Record count, or CONFIRM");
+    await user.type(field, "1");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+
+    await user.clear(field);
+    await user.type(field, "2");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "Confirm" }));
+    await waitFor(() => expect(sent).toContain("confirm_command"));
+  });
+
+  it("a production delete of one record will not accept the count", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        production: true,
+        extraStep: {
+          kind: "confirmWord",
+          prompt: "This connection is flagged production. Type the word CONFIRM to continue.",
+        },
+      },
+    });
+    const user = await submit("delete users where id is 3");
+
+    const field = await screen.findByLabelText("Type CONFIRM");
+    await user.type(field, "1");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+
+    await user.clear(field);
+    await user.type(field, "CONFIRM");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeEnabled();
+  });
+
+  it("a production drop is gated on the table name, not the record count", async () => {
+    mockBackend({
+      submit_command: {
+        ...NEEDS_CONFIRMATION,
+        operation: "drop_table",
+        production: true,
+        description: "Drop the table users, removing its records and its structure",
+        preview: {
+          previewKind: "table",
+          columns: [{ name: "id", dataType: "integer", nullable: false }],
+          rowCount: 7,
+          statement: "SELECT count(*)",
+        },
+        extraStep: {
+          kind: "tableName",
+          table: "users",
+          prompt:
+            "This connection is flagged production. Type the table's name, users, to continue.",
+        },
+      },
+    });
+    const user = await submit("drop table users");
+
+    const field = await screen.findByLabelText("Table name");
+    // The row count is not a way past this gate.
+    await user.type(field, "7");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+
+    await user.clear(field);
+    await user.type(field, "users");
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeEnabled();
+  });
+
+  it("an unflagged connection asks for nothing extra", async () => {
+    mockBackend();
+    await submit("delete users where active is false");
+
+    expect(await screen.findByRole("button", { name: "Confirm" })).toBeEnabled();
+    expect(screen.queryByLabelText(/CONFIRM|Table name/)).not.toBeInTheDocument();
   });
 
   it("a read shows its result with no confirmation step", async () => {

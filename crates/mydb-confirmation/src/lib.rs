@@ -13,8 +13,10 @@
 //! check.
 
 mod error;
+mod extra_step;
 
 pub use error::WorkflowError;
+pub use extra_step::{ExtraStep, CONFIRM_WORD};
 
 use mydb_adapters::{Adapter, ExecutionOutcome, Preview, RecordSet};
 use mydb_core::Intent;
@@ -58,6 +60,13 @@ pub struct Cancelled {
 #[derive(Debug)]
 pub struct PendingWrite {
     preview: Preview,
+    /// Worked out when the preview was built, from the count the user is
+    /// actually looking at, so the number they are asked to type is the
+    /// number they were shown.
+    extra_step: ExtraStep,
+    /// Remembered so an edit re-derives the step for the revised command
+    /// against the same connection.
+    production: bool,
 }
 
 /// A write that ran.
@@ -76,14 +85,21 @@ pub struct Completed {
 /// to confirm: docs/17-coding-standards.md's rule that a failed preview must
 /// stop the workflow before confirm is not a check to perform but a value
 /// that does not exist.
-pub async fn begin(adapter: &dyn Adapter, intent: Intent) -> Result<Step, WorkflowError> {
+pub async fn begin(
+    adapter: &dyn Adapter,
+    intent: Intent,
+    production: bool,
+) -> Result<Step, WorkflowError> {
     if intent.is_write() {
         let preview = adapter
             .build_preview(&intent)
             .await
             .map_err(WorkflowError::Preview)?;
+        let extra_step = ExtraStep::required_for(&intent, production, preview.affected_count());
         Ok(Step::AwaitingConfirmation(Box::new(PendingWrite {
             preview,
+            extra_step,
+            production,
         })))
     } else {
         let records = adapter
@@ -109,11 +125,35 @@ impl PendingWrite {
         self.preview.intent().describe()
     }
 
+    /// What the user must type before this can run, if anything
+    /// (docs/11-production-safety-flag.md).
+    pub fn extra_step(&self) -> &ExtraStep {
+        &self.extra_step
+    }
+
     /// Runs the write. docs/05 step 10.
     ///
     /// Consumes the pending write, so one confirmation cannot be replayed
     /// into two executions.
-    pub async fn confirm(self, adapter: &dyn Adapter) -> Result<Completed, WorkflowError> {
+    ///
+    /// `authorization` is whatever the user typed into the extra step. It is
+    /// checked here, in the engine, and not only wherever the interface
+    /// happens to disable a button: a gate enforced solely in the interface
+    /// is not a gate.
+    pub async fn confirm(
+        self,
+        adapter: &dyn Adapter,
+        authorization: &str,
+    ) -> Result<Completed, WorkflowError> {
+        if !self.extra_step.accepts(authorization) {
+            return Err(WorkflowError::ExtraStepNotSatisfied {
+                prompt: self
+                    .extra_step
+                    .prompt()
+                    .unwrap_or_else(|| "this change needs an extra confirmation".to_string()),
+            });
+        }
+
         let description = self.description();
         let outcome = adapter
             .execute(self.preview.approve())
@@ -134,7 +174,7 @@ impl PendingWrite {
     pub async fn edit(self, adapter: &dyn Adapter, revised: Intent) -> Result<Step, WorkflowError> {
         // The previous pending write is dropped here. Its approval, had it
         // been given, cannot survive into the revised command.
-        begin(adapter, revised).await
+        begin(adapter, revised, self.production).await
     }
 
     /// Discards the command. docs/05 step 9.
